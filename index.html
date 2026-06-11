@@ -247,6 +247,200 @@ function spawnPositions(map, castleX, castleY, n, occupied) {
   return res;
 }
 
+// ===== Phase 4 — AI 系統（純邏輯）=====
+
+// 期望傷害（無隨機）：含迴避折扣與 10% 暴擊期望
+function expectedDamage(attacker, defender, map) {
+  const dT = TERRAIN_INFO[map[defender.y][defender.x]];
+  let atk = attacker.atk;
+  if (attacker.ability === "武聖" && attacker.hp < attacker.maxHp * 0.5) atk *= 1.3;
+  if (attacker.atkDebuff > 0) atk *= 0.7;
+  const raw = Math.max(1, Math.round(atk - (defender.def + dT.def)));
+  return raw * (1 - dT.evade / 100) * 1.05;
+}
+
+// 列舉一個單位所有 (移動 + 攻擊/不攻擊) 組合
+function enumerateActions(map, units, unit) {
+  const moves = [{ x: unit.x, y: unit.y, stay: true }].concat(reachableTiles(map, units, unit));
+  const actions = [];
+  for (const mv of moves) {
+    const ghost = Object.assign({}, unit, { x: mv.x, y: mv.y, moved: !mv.stay });
+    actions.push({ unitId: unit.id, to: mv, targetId: null });
+    for (const t of targetsInRange(units, ghost, mv.x, mv.y))
+      actions.push({ unitId: unit.id, to: mv, targetId: t.id });
+  }
+  return actions;
+}
+
+// 威脅地圖：attackerSide 所有單位可攻擊到的格 → 累計攻擊力
+function buildThreatMap(map, units, attackerSide) {
+  const tm = {};
+  for (const p of livingUnits(units, attackerSide)) {
+    const rng = effectiveRng(Object.assign({}, p, { moved: false }));
+    if (rng <= 0) continue;
+    const cells = [{ x: p.x, y: p.y }].concat(reachableTiles(map, units, p));
+    const seen = new Set();
+    for (const c of cells) {
+      for (let dx = -rng; dx <= rng; dx++) {
+        const rem = rng - Math.abs(dx);
+        for (let dy = -rem; dy <= rem; dy++) {
+          const nx = c.x + dx, ny = c.y + dy;
+          if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) continue;
+          const key = nx + "," + ny;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const cell = tm[key] || (tm[key] = { sum: 0, max: 0 });
+          cell.sum += p.atk;
+          cell.max = Math.max(cell.max, p.atk);
+        }
+      }
+    }
+  }
+  return tm;
+}
+
+// 加權評分（守將＝防守傾向；謀士／軍師＝進攻傾向）
+function scoreAction(map, units, action, ctx) {
+  const u = ctx.aiUnit;
+  const to = action.to;
+  let score = 0;
+  const target = action.targetId ? units.find(t => t.id === action.targetId) : null;
+  if (target) {
+    const ghost = Object.assign({}, u, { x: to.x, y: to.y, moved: !to.stay });
+    const ed = expectedDamage(ghost, target, map);
+    score += Math.min(ed, target.hp) * 1.2;                       // damage_dealt
+    if (ed >= target.hp) score += 40;                             // 擊殺獎勵
+    const flank = livingUnits(units, u.side).some(a =>            // 側翼 +20%
+      a.id !== u.id && manhattan(a.x, a.y, target.x, target.y) === 1);
+    if (flank) score += ed * 0.2;
+  }
+  const terr = TERRAIN_INFO[map[to.y][to.x]];
+  score += terr.def * 0.8 * 4;                                    // terrain_def_bonus
+  const threat = ctx.threatMap[to.x + "," + to.y];                // damage_received（以最強攻擊者估算）
+  if (threat) {
+    score -= Math.max(0, threat.max - (u.def + terr.def)) * 1.0;
+    if (u.hp < u.maxHp * 0.35) score -= 30;                       // low_hp_retreat_penalty
+  }
+  if (ctx.difficulty === "守將") {
+    score -= manhattan(to.x, to.y, ctx.ownCastle.x, ctx.ownCastle.y) * 1.2;  // 死守城池
+  } else {
+    score -= manhattan(to.x, to.y, ctx.targetCastle.x, ctx.targetCastle.y) * 0.6;  // proximity_to_stronghold
+    if (to.x === ctx.targetCastle.x && to.y === ctx.targetCastle.y) score += 500;  // 佔城即勝
+  }
+  return score;
+}
+
+// 模擬執行動作（不改原狀態）
+function applyActionSim(map, units, action) {
+  const us = units.map(u => Object.assign({}, u));
+  const u = us.find(x => x.id === action.unitId);
+  u.x = action.to.x; u.y = action.to.y;
+  if (!action.to.stay) u.moved = true;
+  if (action.targetId) {
+    const t = us.find(x => x.id === action.targetId);
+    t.hp = Math.max(0, t.hp - Math.round(expectedDamage(u, t, map)));
+  }
+  return us;
+}
+
+function evaluateBoard(map, units, aiSide, ctx) {
+  let score = 0;
+  for (const u of livingUnits(units)) {
+    if (u.side === aiSide) {
+      score += u.hp;
+      score += TERRAIN_INFO[map[u.y][u.x]].def * 0.8 * 4;
+      score -= manhattan(u.x, u.y, ctx.targetCastle.x, ctx.targetCastle.y) * 0.6;
+      if (u.hp < 30) score -= 20;
+    } else {
+      score -= u.hp;
+    }
+  }
+  return score;
+}
+
+// 軍師：minimax 深度 2（AI 行動 → 玩家最佳回應）+ alpha-beta + deadline 超時保護
+function chooseActionMinimax(map, units, unit, ctx, deadline) {
+  const scored = enumerateActions(map, units, unit)
+    .map(a => ({ a, s: scoreAction(map, units, a, ctx) }))
+    .sort((p, q) => q.s - p.s)
+    .slice(0, 10);                                  // 先修枝：只展開前 10 個分支
+  let best = scored[0].a, bestVal = -Infinity, alpha = -Infinity;
+  for (const cand of scored) {
+    if (Date.now() > deadline) break;               // 超時：回傳目前最佳
+    const sim = applyActionSim(map, units, cand.a);
+    const val = minPlayerResponse(map, sim, ctx, alpha, deadline);
+    if (val > bestVal) { bestVal = val; best = cand.a; }
+    alpha = Math.max(alpha, val);
+  }
+  return best;
+}
+
+function minPlayerResponse(map, units, ctx, alpha, deadline) {
+  let worst = Infinity;
+  const enemyOf = ctx.aiUnit.side;
+  const playerSide = enemyOf === "enemy" ? "player" : "enemy";
+  for (const p of livingUnits(units, playerSide)) {
+    if (Date.now() > deadline) break;
+    let bestS = -Infinity, bestA = null;
+    for (const a of enumerateActions(map, units, p)) {
+      let s = 0;
+      const t = a.targetId ? units.find(x => x.id === a.targetId) : null;
+      if (t) {
+        const g = Object.assign({}, p, { x: a.to.x, y: a.to.y, moved: !a.to.stay });
+        const ed = expectedDamage(g, t, map);
+        s = Math.min(ed, t.hp) + (ed >= t.hp ? 40 : 0);
+      }
+      if (s > bestS) { bestS = s; bestA = a; }
+    }
+    if (bestA) {
+      const v = evaluateBoard(map, applyActionSim(map, units, bestA), enemyOf, ctx);
+      worst = Math.min(worst, v);
+      if (worst <= alpha) break;                    // alpha-beta 修枝
+    }
+  }
+  return worst === Infinity ? evaluateBoard(map, units, enemyOf, ctx) : worst;
+}
+
+// 三難度入口：永遠回傳有效動作（最少 stay 原地）
+function chooseAction(map, units, unit, difficulty, castles, deadline) {
+  const ctx = Object.assign({ aiUnit: unit, difficulty }, castles);
+  ctx.threatMap = buildThreatMap(map, units, unit.side === "enemy" ? "player" : "enemy");
+  if (difficulty === "軍師" && Date.now() < deadline)
+    return chooseActionMinimax(map, units, unit, ctx, deadline);
+  let best = { unitId: unit.id, to: { x: unit.x, y: unit.y, stay: true }, targetId: null };
+  let bestS = -Infinity;
+  for (const a of enumerateActions(map, units, unit)) {
+    const s = scoreAction(map, units, a, ctx);
+    if (s > bestS) { bestS = s; best = a; }
+  }
+  return best;
+}
+
+// ===== 主動技能 =====
+function canUseAbility(u) {
+  return !!u.ability && !ABILITIES[u.ability].passive && u.cooldown === 0 && u.abilityUses > 0;
+}
+function countAdjacentEnemies(units, unit) {  // 周圍八格（Chebyshev 距離 1）
+  return livingUnits(units).filter(t => t.side !== unit.side &&
+    Math.max(Math.abs(t.x - unit.x), Math.abs(t.y - unit.y)) === 1).length;
+}
+function unitsInDanger(map, units, side) {
+  const tm = buildThreatMap(map, units, side === "enemy" ? "player" : "enemy");
+  return livingUnits(units, side).filter(u => {
+    const t = tm[u.x + "," + u.y];
+    return t && t.sum > u.hp * 0.6;
+  }).length;
+}
+function shouldUseAbility(map, units, unit) {
+  if (!canUseAbility(unit)) return false;
+  switch (unit.ability) {
+    case "空城計": return unitsInDanger(map, units, unit.side) > 1;
+    case "火攻":   return countAdjacentEnemies(units, unit) >= 2;
+    case "弱化":   return countAdjacentEnemies(units, unit) >= 2;
+    default: return false;
+  }
+}
+
 // [LOGIC-END]
 
 // ============================================================
@@ -272,6 +466,8 @@ class BattleScene extends Phaser.Scene {
     this.turnSide = "player";
     this.busy = false;          // 動畫/敵方回合中鎖輸入
     this.battleOver = false;
+    this.skipSide = null;       // 空城計跳過邊一方
+
   }
 
   create() {
@@ -404,6 +600,15 @@ class BattleScene extends Phaser.Scene {
       if (!this.busy && this.selected && !this.selected.acted) this.finishUnit(this.selected);
     });
     this.waitBtn.setVisible(false);
+    // 技能按鈕：主動技（空城計／火攻／弱化）
+    this.abilityBtn = this.makeButton(GAME_W - 80, GAME_H - 146, 130, 38, "技能", () => {
+      const u = this.selected;
+      if (!this.busy && u && !u.acted && canUseAbility(u)) {
+        this.castAbility(u);
+        if (!this.battleOver) this.deselect();
+      }
+    });
+    this.abilityBtn.setVisible(false);
   }
 
   makeButton(cx, cy, w, h, label, onClick) {
@@ -471,6 +676,8 @@ class BattleScene extends Phaser.Scene {
     this.attackSet = !u.acted ? targetsInRange(this.units, u, u.x, u.y) : [];
     this.drawHighlights();
     this.waitBtn.setVisible(!u.acted);
+    this.abilityBtn.setVisible(!u.acted && canUseAbility(u));
+    this.abilityBtn.setLabel(u.ability ? `技能・${u.ability}` : "技能");
   }
 
   deselect() {
@@ -481,6 +688,7 @@ class BattleScene extends Phaser.Scene {
     this.selGfx.clear();
     this.showUnitInfo(null);
     this.waitBtn.setVisible(false);
+    this.abilityBtn.setVisible(false);
   }
 
   drawHighlights() {
@@ -528,18 +736,21 @@ class BattleScene extends Phaser.Scene {
     this.drawHighlights();
     this.showUnitInfo(u);
     this.waitBtn.setVisible(true);
+    this.abilityBtn.setVisible(canUseAbility(u));
   }
 
   finishUnit(u) {
     u.moved = true; u.acted = true;
     this.refreshUnitView(u);
     this.deselect();
+    this.checkBattleEnd();   // 佔城判定
   }
 
-  doAttack(att, def) {
+  doAttack(att, def, onDone) {
     this.busy = true;
     this.hlGfx.clear(); this.selGfx.clear();
     this.waitBtn.setVisible(false);
+    this.abilityBtn.setVisible(false);
     const av = this.unitViews[att.id];
     const home = this.tileCenter(att.x, att.y);
     const tgt = this.tileCenter(def.x, def.y);
@@ -552,8 +763,11 @@ class BattleScene extends Phaser.Scene {
       onYoyo: () => this.applyHit(att, def),
       onComplete: () => {
         this.busy = false;
-        this.finishUnit(att);
+        att.moved = true; att.acted = true;
+        this.refreshUnitView(att);
+        if (att.side === "player") this.deselect();
         this.checkBattleEnd();
+        if (onDone) onDone();
       }
     });
   }
@@ -599,14 +813,17 @@ class BattleScene extends Phaser.Scene {
     });
   }
 
-  // 勝敗檢查（Phase 8 改為完整結算畫面）
+  // 勝敗檢查：殲滅 或 佔領城池（Phase 8 改為完整結算畫面）
   checkBattleEnd() {
     if (this.battleOver) return;
     const pAlive = livingUnits(this.units, "player").length;
     const eAlive = livingUnits(this.units, "enemy").length;
-    if (pAlive > 0 && eAlive > 0) return;
+    const pCastleOcc = unitAt(this.units, this.playerCastle.x, this.playerCastle.y);
+    const eCastleOcc = unitAt(this.units, this.enemyCastle.x, this.enemyCastle.y);
+    const win = eAlive === 0 || (eCastleOcc && eCastleOcc.side === "player");
+    const lose = pAlive === 0 || (pCastleOcc && pCastleOcc.side === "enemy");
+    if (!win && !lose) return;
     this.battleOver = true;
-    const win = eAlive === 0;
     this.add.rectangle(GAME_W / 2, GAME_H / 2, GAME_W, 120, 0x2c1a08, 0.82).setDepth(70);
     this.add.text(GAME_W / 2, GAME_H / 2, win ? "勝　利" : "敗　北", {
       fontSize: "46px", color: win ? "#e8c070" : "#b0b0c0", fontStyle: "bold",
@@ -618,20 +835,114 @@ class BattleScene extends Phaser.Scene {
     this.deselect();
     this.turnSide = "enemy";
     this.refreshTopBar();
-    // Phase 4 加入 AI；目前敵方直接跳過
-    this.time.delayedCall(400, () => this.startPlayerTurn());
+    if (this.skipSide === "enemy") {   // 空城計：敵方按兵不動
+      this.skipSide = null;
+      this.floatText(GAME_W / 2, GAME_H / 2 - 40, "空城計生效！敵軍按兵不動", "#2c1a08", true);
+      this.time.delayedCall(1000, () => this.startPlayerTurn());
+      return;
+    }
+    this.time.delayedCall(500, () => this.runEnemyTurn());
+  }
+
+  // ----- Phase 4：敵方 AI 回合 -----
+  runEnemyTurn() {
+    if (this.battleOver) return;
+    for (const u of livingUnits(this.units, "enemy")) {
+      u.moved = false; u.acted = false;
+      if (u.cooldown > 0) u.cooldown--;
+      if (u.atkDebuff > 0) u.atkDebuff--;
+    }
+    const deadline = Date.now() + 3000;   // 整個 AI 回合思考上限 3 秒
+    const castles = { ownCastle: this.enemyCastle, targetCastle: this.playerCastle };
+    const queue = livingUnits(this.units, "enemy").map(u => u.id);
+    const step = (i) => {
+      if (this.battleOver) return;
+      if (i >= queue.length) { this.time.delayedCall(400, () => this.startPlayerTurn()); return; }
+      const u = this.units.find(x => x.id === queue[i]);
+      if (!u || u.hp <= 0) { step(i + 1); return; }
+      if (shouldUseAbility(this.map, this.units, u)) {
+        this.castAbility(u);
+        this.time.delayedCall(500, () => step(i + 1));   // 行動之間 500ms 可視延遲
+        return;
+      }
+      const action = chooseAction(this.map, this.units, u, this.difficulty, castles, deadline);
+      this.performAIAction(u, action, () => this.time.delayedCall(500, () => step(i + 1)));
+    };
+    step(0);
+  }
+
+  performAIAction(u, action, done) {
+    const afterMovePart = () => {
+      if (action.targetId) {
+        const t = this.units.find(x => x.id === action.targetId);
+        if (t && t.hp > 0) { this.doAttack(u, t, done); return; }
+      }
+      u.acted = true;
+      this.checkBattleEnd();
+      done();
+    };
+    if (!action) { done(); return; }
+    if (!action.to.stay) {
+      u.x = action.to.x; u.y = action.to.y; u.moved = true;
+      const v = this.unitViews[u.id];
+      const { x, y } = this.tileCenter(u.x, u.y);
+      this.tweens.add({
+        targets: v.c, x, y, duration: 300, ease: "Power2",
+        onComplete: () => { v.c.setDepth(10 + u.y); this.checkBattleEnd(); if (!this.battleOver) afterMovePart(); }
+      });
+    } else afterMovePart();
+  }
+
+  // ----- 主動技能（玩家／AI 共用）-----
+  castAbility(u) {
+    const pos = this.tileCenter(u.x, u.y);
+    const adj = livingUnits(this.units).filter(t => t.side !== u.side &&
+      Math.max(Math.abs(t.x - u.x), Math.abs(t.y - u.y)) === 1);
+    if (u.ability === "空城計") {
+      u.abilityUses--;
+      this.skipSide = u.side === "player" ? "enemy" : "player";
+      this.floatText(pos.x, pos.y - 22, "空城計！", "#2c1a08", true);
+    } else if (u.ability === "火攻") {
+      u.cooldown = ABILITIES["火攻"].cd;
+      this.floatText(pos.x, pos.y - 22, "火攻！", "#c03010", true);
+      for (const t of adj) {
+        t.hp = Math.max(0, t.hp - 35);
+        const tp = this.tileCenter(t.x, t.y);
+        this.floatText(tp.x, tp.y - 14, "-35", "#c05010", false);
+        this.refreshUnitView(t);
+        if (t.hp <= 0) this.killUnit(t);
+      }
+    } else if (u.ability === "弱化") {
+      u.cooldown = ABILITIES["弱化"].cd;
+      this.floatText(pos.x, pos.y - 22, "弱化！", "#404080", true);
+      for (const t of adj) {
+        t.atkDebuff = 2;
+        const tp = this.tileCenter(t.x, t.y);
+        this.floatText(tp.x, tp.y - 14, "攻↓", "#404080", false);
+      }
+    }
+    u.acted = true; u.moved = true;
+    this.refreshUnitView(u);
+    this.checkBattleEnd();
   }
 
   startPlayerTurn() {
+    if (this.battleOver) return;
     this.round++;
     this.turnSide = "player";
-    for (const u of livingUnits(this.units)) {
-      if (u.cooldown > 0 && u.side === "player") u.cooldown--;
+    for (const u of livingUnits(this.units, "player")) {
+      if (u.cooldown > 0) u.cooldown--;
       if (u.atkDebuff > 0) u.atkDebuff--;
       u.moved = false; u.acted = false;
       this.refreshUnitView(u);
     }
     this.refreshTopBar();
+    if (this.skipSide === "player") {   // AI 空城計：我軍被跳過
+      this.skipSide = null;
+      this.floatText(GAME_W / 2, GAME_H / 2 - 40, "敵方空城計！我軍按兵不動", "#2c1a08", true);
+      for (const u of livingUnits(this.units, "player")) u.acted = true;
+      this.time.delayedCall(1200, () => { if (!this.battleOver) this.endPlayerTurn(); });
+    }
   }
 
   // ----- 座標轉換 -----
