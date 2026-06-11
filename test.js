@@ -218,5 +218,44 @@ for (const seed of [1001, 2002, 3003]) {
 assert(L.isConnectedMap(L.generateFallbackMap(12, 10)), "備用地圖連通");
 assert(L.getRoundSeed(1) === 1001 && L.getRoundSeed(2) === 2002 && L.getRoundSeed(3) === 3003, "前三關固定 seed");
 
+// ===== Phase 8 — 完整對局模擬（AI vs AI，雙方都用 chooseAction）=====
+{
+  const { map: m } = L.generateMap(1001, 12, 10, "謀士");
+  const pc = L.findTile(m, L.T.CASTLE_P), ec = L.findTile(m, L.T.CASTLE_E);
+  const occ = new Set();
+  const ps = L.spawnPositions(m, pc[0], pc[1], 5, occ);
+  const es = L.spawnPositions(m, ec[0], ec[1], 5, occ);
+  const units = [];
+  L.ROSTERS.shu.forEach((e, i) => units.push(L.makeUnit("shu", "player", e, ps[i].x, ps[i].y)));
+  L.ROSTERS.wu.forEach((e, i) => units.push(L.makeUnit("wu", "enemy", e, es[i].x, es[i].y)));
+  let winner = null, invalid = 0;
+  outer:
+  for (let round = 0; round < 100; round++) {
+    for (const side of ["player", "enemy"]) {
+      const own = side === "player" ? pc : ec, tgt = side === "player" ? ec : pc;
+      const castles = { ownCastle: { x: own[0], y: own[1] }, targetCastle: { x: tgt[0], y: tgt[1] }, round };
+      for (const u of L.livingUnits(units, side)) {
+        u.moved = false; u.acted = false;
+        const a = L.chooseAction(m, units, u, "謀士", castles, Date.now() + 500);
+        if (!a || !a.to || !Number.isInteger(a.to.x)) { invalid++; continue; }
+        u.x = a.to.x; u.y = a.to.y;
+        if (a.targetId) {
+          const t = units.find(x => x.id === a.targetId);
+          if (t && t.hp > 0) {
+            const r = L.computeDamage(u, t, m, Math.random);
+            if (!r.miss) t.hp = Math.max(0, t.hp - r.dmg);
+          }
+        }
+      }
+      const pA = L.livingUnits(units, "player").length, eA = L.livingUnits(units, "enemy").length;
+      const pOcc = L.unitAt(units, pc[0], pc[1]), eOcc = L.unitAt(units, ec[0], ec[1]);
+      if (eA === 0 || (eOcc && eOcc.side === "player")) { winner = "player"; break outer; }
+      if (pA === 0 || (pOcc && pOcc.side === "enemy")) { winner = "enemy"; break outer; }
+    }
+  }
+  assert(invalid === 0, "完整對局：AI 全程無無效動作");
+  assert(winner !== null, "完整對局：100 回合內分出勝負（勝方：" + winner + "）");
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

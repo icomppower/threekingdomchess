@@ -22,14 +22,18 @@
   }
   /* seed 輸入框（標題畫面用，DOM overlay） */
   #seed-input {
-    position: absolute;
+    position: fixed;
+    left: 50%;
+    bottom: 14px;
+    transform: translateX(-50%);
     display: none;
-    width: 130px;
-    padding: 4px 8px;
+    width: 180px;
+    padding: 8px 10px;
     background: #ece0c4;
     border: 1px solid #8b7050;
     color: #2c1a08;
-    font-size: 13px;
+    font-size: 14px;
+    text-align: center;
     outline: none;
   }
 </style>
@@ -320,16 +324,20 @@ function scoreAction(map, units, action, ctx) {
     if (flank) score += ed * 0.2;
   }
   const terr = TERRAIN_INFO[map[to.y][to.x]];
-  score += terr.def * 0.8 * 4;                                    // terrain_def_bonus
+  score += terr.def * 0.8;                                        // terrain_def_bonus
   const threat = ctx.threatMap[to.x + "," + to.y];                // damage_received（以最強攻擊者估算）
   if (threat) {
-    score -= Math.max(0, threat.max - (u.def + terr.def)) * 1.0;
+    // 回合越後越敢進攻（避免雙方喺威脅圈外永遠對峙）
+    const caution = Math.max(0.2, 1 - (ctx.round || 1) * 0.04);
+    score -= Math.max(0, threat.max - (u.def + terr.def)) * caution;
     if (u.hp < u.maxHp * 0.35) score -= 30;                       // low_hp_retreat_penalty
   }
   if (ctx.difficulty === "守將") {
     score -= manhattan(to.x, to.y, ctx.ownCastle.x, ctx.ownCastle.y) * 1.2;  // 死守城池
   } else {
-    score -= manhattan(to.x, to.y, ctx.targetCastle.x, ctx.targetCastle.y) * 0.6;  // proximity_to_stronghold
+    // proximity_to_stronghold：回合越後進攻意欲越強（防止無限對峙）
+    const advance = 0.6 * (1 + (ctx.round || 1) * 0.2);
+    score -= manhattan(to.x, to.y, ctx.targetCastle.x, ctx.targetCastle.y) * advance;
     if (to.x === ctx.targetCastle.x && to.y === ctx.targetCastle.y) score += 500;  // 佔城即勝
   }
   return score;
@@ -353,7 +361,7 @@ function evaluateBoard(map, units, aiSide, ctx) {
   for (const u of livingUnits(units)) {
     if (u.side === aiSide) {
       score += u.hp;
-      score += TERRAIN_INFO[map[u.y][u.x]].def * 0.8 * 4;
+      score += TERRAIN_INFO[map[u.y][u.x]].def * 0.8;
       score -= manhattan(u.x, u.y, ctx.targetCastle.x, ctx.targetCastle.y) * 0.6;
       if (u.hp < 30) score -= 20;
     } else {
@@ -640,6 +648,7 @@ const SFX = {
   move()   { if (this.ready) this.tri.triggerAttackRelease("E4", "32n"); },
   miss()   { if (this.ready) this.tri.triggerAttackRelease("A3", "32n"); },
   roundStart() { if (this.ready) this.metal.triggerAttackRelease("C3", "16n"); },
+  gong() { if (this.ready) this.metal.triggerAttackRelease("E2", "1n"); },   // 場景轉換鑼聲
   victory() {    // 五聲音階上行
     if (!this.ready) return;
     this.stopBGM();
@@ -678,6 +687,161 @@ document.addEventListener("pointerdown", () => {
 }, { once: true });
 
 // ============================================================
+// Phase 8 — 場景共用：淡出 + 鑼聲轉場、宣紙背景、按鈕
+// ============================================================
+function fadeTo(scene, key, data) {
+  SFX.gong();
+  scene.cameras.main.fadeOut(300, 20, 14, 8);
+  scene.cameras.main.once("camerafadeoutcomplete", () => scene.scene.start(key, data));
+}
+
+function drawParchment(scene) {
+  const g = scene.add.graphics();
+  g.fillStyle(PARCHMENT, 1).fillRect(0, 0, GAME_W, GAME_H);
+  g.fillStyle(0xe6dcc0, 0.5);
+  g.fillEllipse(0, 0, 360, 220);
+  g.fillEllipse(GAME_W, GAME_H, 420, 260);
+  g.fillStyle(0xdfd4b4, 0.35);
+  g.fillEllipse(GAME_W, 0, 300, 180);
+  return g;
+}
+
+function uiButton(scene, cx, cy, w, h, label, fontSize, onClick) {
+  const r = scene.add.rectangle(cx, cy, w, h, PANEL, 1)
+    .setStrokeStyle(1.5, BORDER).setInteractive({ useHandCursor: true });
+  const t = scene.add.text(cx, cy, label, {
+    fontSize, color: "#2c1a08", fontStyle: "bold",
+    fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+  }).setOrigin(0.5);
+  r.on("pointerover", () => r.setFillStyle(0xf6eed4));
+  r.on("pointerout", () => r.setFillStyle(PANEL));
+  r.on("pointerdown", () => { SFX.select(); onClick(); });
+  return { r, t };
+}
+
+// ============================================================
+// Phase 8 — 標題畫面：陣營 + 難度選擇 + seed 輸入
+// ============================================================
+class TitleScene extends Phaser.Scene {
+  constructor() { super("Title"); }
+
+  create() {
+    this.cameras.main.fadeIn(300, 20, 14, 8);
+    drawParchment(this);
+    this.faction = "shu";
+    this.difficulty = "謀士";
+
+    this.add.text(GAME_W / 2, 95, "三國水墨戰棋", {
+      fontSize: "54px", color: "#2c1a08", fontStyle: "bold",
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+    }).setOrigin(0.5);
+    this.add.text(GAME_W / 2, 148, "— Three Kingdoms Chess —", {
+      fontSize: "16px", color: "#8b7050"
+    }).setOrigin(0.5);
+
+    // 陣營選擇
+    this.add.text(GAME_W / 2, 205, "揀選陣營", { fontSize: "18px", color: "#2c1a08", fontStyle: "bold",
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif' }).setOrigin(0.5);
+    this.factionBtns = {};
+    const fKeys = ["wei", "shu", "wu"];
+    fKeys.forEach((fk, i) => {
+      const f = FACTIONS[fk];
+      const cx = GAME_W / 2 + (i - 1) * 175, cy = 270;
+      const r = this.add.rectangle(cx, cy, 150, 78, f.fill, 1)
+        .setStrokeStyle(2, f.border).setInteractive({ useHandCursor: true });
+      this.add.text(cx, cy - 8, f.name, { fontSize: "34px", color: f.css, fontStyle: "bold",
+        fontFamily: '"PingFang TC","Microsoft JhengHei",serif' }).setOrigin(0.5);
+      this.add.text(cx, cy + 24, ROSTERS[fk].map(e => e.general).slice(0, 3).join("·"), {
+        fontSize: "11px", color: "#2c1a08" }).setOrigin(0.5);
+      r.on("pointerdown", () => { SFX.select(); this.faction = fk; this.refreshSelect(); });
+      this.factionBtns[fk] = r;
+    });
+
+    // 難度選擇
+    this.add.text(GAME_W / 2, 345, "難度", { fontSize: "18px", color: "#2c1a08", fontStyle: "bold",
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif' }).setOrigin(0.5);
+    this.diffBtns = {};
+    ["守將", "謀士", "軍師"].forEach((d, i) => {
+      const cx = GAME_W / 2 + (i - 1) * 150, cy = 398;
+      const b = uiButton(this, cx, cy, 130, 52, d, "20px", () => { this.difficulty = d; this.refreshSelect(); });
+      this.diffBtns[d] = b.r;
+    });
+
+    // 開戰
+    uiButton(this, GAME_W / 2, 488, 220, 64, "開　戰", "26px", () => this.startBattle());
+    this.add.text(GAME_W / 2, 545, "可喺下方輸入 seed 重玩特定地圖（留空＝官方關卡）", {
+      fontSize: "12px", color: "#8b7050" }).setOrigin(0.5);
+
+    // seed 輸入框（DOM overlay）
+    const input = document.getElementById("seed-input");
+    input.style.display = "block";
+    input.value = "";
+
+    this.refreshSelect();
+    if (location.hash.includes("battle")) this.startBattle();   // #battle：跳過標題直入戰場（測試用）
+  }
+
+  refreshSelect() {
+    for (const fk in this.factionBtns)
+      this.factionBtns[fk].setStrokeStyle(fk === this.faction ? 4 : 2,
+        fk === this.faction ? INK : FACTIONS[fk].border);
+    for (const d in this.diffBtns)
+      this.diffBtns[d].setStrokeStyle(d === this.difficulty ? 3 : 1.5,
+        d === this.difficulty ? INK : BORDER);
+  }
+
+  startBattle() {
+    const input = document.getElementById("seed-input");
+    const v = parseInt(input.value, 10);
+    const seed = Number.isFinite(v) ? v : null;
+    input.style.display = "none";
+    fadeTo(this, "Battle", {
+      playerFaction: this.faction, difficulty: this.difficulty, seed, stage: 1
+    });
+  }
+}
+
+// ============================================================
+// Phase 8 — 結算畫面：勝敗 + 戰報
+// ============================================================
+class ResultScene extends Phaser.Scene {
+  constructor() { super("Result"); }
+  init(data) { this.data_ = data; }
+
+  create() {
+    this.cameras.main.fadeIn(300, 20, 14, 8);
+    drawParchment(this);
+    const d = this.data_;
+    this.add.text(GAME_W / 2, 130, d.win ? "勝　利" : "敗　北", {
+      fontSize: "62px", color: d.win ? "#8b4010" : "#5a5a72", fontStyle: "bold",
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+    }).setOrigin(0.5);
+
+    const lines = [
+      `第 ${d.stage} 關　${FACTIONS[d.faction].name}軍　[${d.difficulty}]`,
+      `經歷回合：${d.rounds}`,
+      `擊破敵將：${d.kills}　損失我將：${d.losses}`,
+      `地圖 seed：${d.seed}`
+    ];
+    this.add.text(GAME_W / 2, 255, lines.join("\n"), {
+      fontSize: "18px", color: "#2c1a08", align: "center", lineSpacing: 10,
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+    }).setOrigin(0.5);
+
+    let y = 400;
+    if (d.win) {
+      uiButton(this, GAME_W / 2, y, 240, 56, `進軍下一關（第 ${d.stage + 1} 關）`, "18px", () =>
+        fadeTo(this, "Battle", { playerFaction: d.faction, difficulty: d.difficulty, seed: null, stage: d.stage + 1 }));
+      y += 70;
+    }
+    uiButton(this, GAME_W / 2, y, 240, 56, "重玩本關（同一地圖）", "18px", () =>
+      fadeTo(this, "Battle", { playerFaction: d.faction, difficulty: d.difficulty, seed: d.seed, stage: d.stage }));
+    uiButton(this, GAME_W / 2, y + 70, 240, 56, "返回主選單", "18px", () =>
+      fadeTo(this, "Title", {}));
+  }
+}
+
+// ============================================================
 // Phase 1 — 戰場場景：水墨側視地圖渲染
 // ============================================================
 class BattleScene extends Phaser.Scene {
@@ -706,10 +870,15 @@ class BattleScene extends Phaser.Scene {
     this.busy = false;          // 動畫/敵方回合中鎖輸入
     this.battleOver = false;
     this.skipSide = null;       // 空城計跳過邊一方
+    this.kills = 0;             // 擊破敵將數
+    this.losses = 0;            // 損失我將數
 
   }
 
   create() {
+    this.cameras.main.fadeIn(300, 20, 14, 8);
+    document.getElementById("seed-input").style.display = "none";
+    SFX.startBGM();
     this.drawBackground();
     // world 容器：地圖＋單位＋高亮，雙指縮放/拖動只作用於此層，UI 固定
     this.world = this.add.container(0, 0);
@@ -1144,6 +1313,7 @@ class BattleScene extends Phaser.Scene {
   }
 
   killUnit(u) {
+    if (u.side === "enemy") this.kills++; else this.losses++;
     SFX.explosion();
     const v = this.unitViews[u.id];
     if (!v) return;
@@ -1170,6 +1340,10 @@ class BattleScene extends Phaser.Scene {
       fontSize: "46px", color: win ? "#e8c070" : "#b0b0c0", fontStyle: "bold",
       fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
     }).setOrigin(0.5).setDepth(71);
+    this.time.delayedCall(1800, () => fadeTo(this, "Result", {
+      win, stage: this.stage, faction: this.playerFaction, difficulty: this.difficulty,
+      rounds: this.round, kills: this.kills, losses: this.losses, seed: this.usedSeed
+    }));
   }
 
   endPlayerTurn() {
@@ -1194,7 +1368,7 @@ class BattleScene extends Phaser.Scene {
       if (u.atkDebuff > 0) u.atkDebuff--;
     }
     const deadline = Date.now() + 3000;   // 整個 AI 回合思考上限 3 秒
-    const castles = { ownCastle: this.enemyCastle, targetCastle: this.playerCastle };
+    const castles = { ownCastle: this.enemyCastle, targetCastle: this.playerCastle, round: this.round };
     const queue = livingUnits(this.units, "enemy").map(u => u.id);
     const step = (i) => {
       if (this.battleOver) return;
@@ -1437,7 +1611,7 @@ const config = {
     min: { width: 320, height: 240 },
     max: { width: 1600, height: 1200 }
   },
-  scene: [BattleScene]   // Phase 8 加入 Title / Result
+  scene: [TitleScene, BattleScene, ResultScene]
 };
 
 window.addEventListener("load", () => {
