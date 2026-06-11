@@ -1220,14 +1220,15 @@ class BattleScene extends Phaser.Scene {
     this.busy = true;
     u.x = tx; u.y = ty; u.moved = true;
     const v = this.unitViews[u.id];
+    if (!v) { this.busy = false; this.afterMove(u); return; }
     const { x, y } = this.tileCenter(tx, ty);
     this.hlGfx.clear();
     this.tweens.add({
       targets: v.c, x, y, duration: 220, ease: "Power2",
       onComplete: () => {
+        this.busy = false;
         v.c.setDepth(10 + ty);
         this.sortWorld();
-        this.busy = false;
         this.afterMove(u);
       }
     });
@@ -1459,6 +1460,7 @@ class BattleScene extends Phaser.Scene {
 
   startPlayerTurn() {
     if (this.battleOver) return;
+    this.busy = false;   // safety reset in case any tween chain left busy stuck
     this.round++;
     this.turnSide = "player";
     SFX.roundStart();
