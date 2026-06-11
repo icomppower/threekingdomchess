@@ -94,6 +94,146 @@ function findTile(map, t) {
   return null;
 }
 
+// ===== 陣營 / 兵種 / 武將 =====
+const FACTIONS = {
+  wei: { name: "魏", fill: 0xc8b8d8, border: 0x5a3880, css: "#5a3880" },
+  shu: { name: "蜀", fill: 0xd0e0b0, border: 0x305820, css: "#305820" },
+  wu:  { name: "吳", fill: 0xe8c070, border: 0x8b4010, css: "#8b4010" }
+};
+const TYPES = {
+  infantry:   { name: "步兵", hp: 100, atk: 30, def: 18, mov: 3, rng: 1 },
+  cavalry:    { name: "騎兵", hp: 90,  atk: 32, def: 12, mov: 4, rng: 1 },
+  archer:     { name: "弓兵", hp: 70,  atk: 28, def: 8,  mov: 2, rng: 2 },
+  strategist: { name: "軍師", hp: 60,  atk: 0,  def: 6,  mov: 2, rng: 0 }
+};
+const ABILITIES = {
+  "武聖":   { desc: "HP低於50%時攻擊+30%", passive: true },
+  "烈弓":   { desc: "本回合未移動時射程加倍", passive: true },
+  "突陣":   { desc: "移動可穿越敵方單位", passive: true },
+  "空城計": { desc: "跳過敵方下個回合（每場限一次）", passive: false, uses: 1 },
+  "火攻":   { desc: "周圍八格敵人受35點傷害", passive: false, cd: 3 },
+  "弱化":   { desc: "相鄰敵人攻擊-30%（2回合）", passive: false, cd: 3 }
+};
+const ROSTERS = {
+  shu: [
+    { general: "關羽",   type: "infantry",   ability: "武聖", atkMod: 4 },
+    { general: "張飛",   type: "infantry",   atkMod: 2, defMod: 2 },
+    { general: "趙雲",   type: "cavalry",    atkMod: 2 },
+    { general: "黃忠",   type: "archer",     ability: "烈弓" },
+    { general: "諸葛亮", type: "strategist", ability: "空城計" }
+  ],
+  wei: [
+    { general: "張遼",   type: "cavalry",    ability: "突陣", atkMod: 3 },
+    { general: "夏侯惇", type: "infantry",   atkMod: 3 },
+    { general: "許褚",   type: "infantry",   defMod: 4 },
+    { general: "夏侯淵", type: "archer",     atkMod: 2 },
+    { general: "司馬懿", type: "strategist", ability: "弱化" }
+  ],
+  wu: [
+    { general: "孫策",   type: "infantry",   atkMod: 4 },
+    { general: "呂蒙",   type: "infantry",   defMod: 2 },
+    { general: "甘寧",   type: "cavalry",    atkMod: 3 },
+    { general: "太史慈", type: "archer",     atkMod: 3 },
+    { general: "周瑜",   type: "strategist", ability: "火攻" }
+  ]
+};
+
+let UNIT_SEQ = 0;
+function makeUnit(factionKey, side, entry, x, y) {
+  const base = TYPES[entry.type];
+  return {
+    id: ++UNIT_SEQ,
+    faction: factionKey, side,
+    general: entry.general, type: entry.type,
+    ability: entry.ability || null,
+    hp: base.hp, maxHp: base.hp,
+    atk: base.atk + (entry.atkMod || 0),
+    def: base.def + (entry.defMod || 0),
+    mov: base.mov, rng: base.rng,
+    x, y,
+    moved: false, acted: false,
+    abilityUses: entry.ability && ABILITIES[entry.ability].uses ? ABILITIES[entry.ability].uses : Infinity,
+    cooldown: 0,
+    atkDebuff: 0   // 弱化回合數
+  };
+}
+
+function unitAt(units, x, y) {
+  return units.find(u => u.hp > 0 && u.x === x && u.y === y) || null;
+}
+function livingUnits(units, side) {
+  return units.filter(u => u.hp > 0 && (!side || u.side === side));
+}
+
+// 移動範圍：考慮地形成本、山地不可通行、敵人擋路（突陣例外）、不可停在他人格
+function reachableTiles(map, units, unit) {
+  const dist = { [unit.x + "," + unit.y]: 0 };
+  const queue = [[unit.x, unit.y, 0]];
+  while (queue.length) {
+    queue.sort((a, b) => a[2] - b[2]);
+    const [cx, cy, cd] = queue.shift();
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const nx = cx + dx, ny = cy + dy;
+      if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) continue;
+      const info = TERRAIN_INFO[map[ny][nx]];
+      if (!info.passable) continue;
+      const occ = unitAt(units, nx, ny);
+      if (occ && occ.side !== unit.side && unit.ability !== "突陣") continue;
+      const nd = cd + info.cost;
+      if (nd > unit.mov) continue;
+      const key = nx + "," + ny;
+      if (dist[key] !== undefined && dist[key] <= nd) continue;
+      dist[key] = nd;
+      queue.push([nx, ny, nd]);
+    }
+  }
+  const res = [];
+  for (const key in dist) {
+    const [x, y] = key.split(",").map(Number);
+    if (x === unit.x && y === unit.y) continue;
+    if (unitAt(units, x, y)) continue;
+    res.push({ x, y });
+  }
+  return res;
+}
+
+function effectiveRng(unit) {
+  if (unit.ability === "烈弓" && !unit.moved) return unit.rng * 2;  // 烈弓：靜止雙倍射程
+  return unit.rng;
+}
+function manhattan(ax, ay, bx, by) { return Math.abs(ax - bx) + Math.abs(ay - by); }
+function targetsInRange(units, unit, fromX, fromY) {
+  const rng = effectiveRng(unit);
+  if (rng <= 0) return [];
+  return livingUnits(units).filter(t =>
+    t.side !== unit.side && manhattan(fromX, fromY, t.x, t.y) <= rng);
+}
+
+// 城池附近出兵點：BFS 由城池向外找可站立格
+function spawnPositions(map, castleX, castleY, n, occupied) {
+  const seen = new Set([castleX + "," + castleY]);
+  const queue = [[castleX, castleY]];
+  const res = [];
+  while (queue.length && res.length < n) {
+    const [cx, cy] = queue.shift();
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const nx = cx + dx, ny = cy + dy;
+      const key = nx + "," + ny;
+      if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS || seen.has(key)) continue;
+      seen.add(key);
+      const t = map[ny][nx];
+      if (!TERRAIN_INFO[t].passable) continue;
+      queue.push([nx, ny]);
+      if (t !== T.CASTLE_P && t !== T.CASTLE_E && !occupied.has(key)) {
+        res.push({ x: nx, y: ny });
+        occupied.add(key);
+        if (res.length >= n) break;
+      }
+    }
+  }
+  return res;
+}
+
 // [LOGIC-END]
 
 // ============================================================
@@ -103,19 +243,274 @@ class BattleScene extends Phaser.Scene {
   constructor() { super("Battle"); }
 
   init(data) {
+    this.playerFaction = data.playerFaction || "shu";
+    this.enemyFaction = data.enemyFaction ||
+      (this.playerFaction === "wei" ? "wu" : this.playerFaction === "shu" ? "wei" : "shu");
+    this.difficulty = data.difficulty || "謀士";
     this.map = parseMap(TEST_MAP_ROWS);   // Phase 7 改為隨機生成
     this.riverTiles = [];
     this.waveOffset = 0;
+    this.units = [];
+    this.unitViews = {};        // unit.id -> container
+    this.selected = null;
+    this.moveSet = [];          // 可移動格
+    this.round = 1;
+    this.turnSide = "player";
+    this.busy = false;          // 動畫/敵方回合中鎖輸入
   }
 
   create() {
     this.drawBackground();
     this.drawMap();
-    // 頂部橫條（Phase 2+ 補充回合資訊）
-    this.topBarText = this.add.text(MAP_X + 2, 8, "三國水墨戰棋", {
-      fontSize: "16px", color: "#2c1a08", fontStyle: "bold",
-      fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+    this.makeUnitTextures();
+    this.placeUnits();
+    this.hlGfx = this.add.graphics();        // 範圍高亮層
+    this.selGfx = this.add.graphics();       // 選取框
+    this.buildUI();
+    this.input.on("pointerdown", p => this.onPointer(p));
+    this.input.keyboard.on("keydown-ESC", () => this.deselect());
+    this.input.keyboard.on("keydown-ENTER", () => { if (!this.busy && this.turnSide === "player") this.endPlayerTurn(); });
+    this.refreshTopBar();
+  }
+
+  // ----- 單位材質：18x22 剪影 + 三角軍旗，全 Graphics 生成 -----
+  makeUnitTextures() {
+    for (const fk of Object.keys(FACTIONS)) {
+      for (const tk of Object.keys(TYPES)) {
+        const key = `unit_${fk}_${tk}`;
+        if (this.textures.exists(key)) continue;
+        const f = FACTIONS[fk];
+        const g = this.make.graphics({ add: false });
+        const W = 26, H = 30, ox = 4, oy = 7;   // 18x22 主體 + 旗
+        // 軍旗
+        g.lineStyle(1.5, INK, 0.9);
+        g.beginPath(); g.moveTo(ox + 15, oy - 6); g.lineTo(ox + 15, oy + 4); g.strokePath();
+        g.fillStyle(f.border, 1).fillTriangle(ox + 15, oy - 6, ox + 15, oy - 1, ox + 22, oy - 3.5);
+        // 主體剪影（按兵種變形）
+        g.fillStyle(f.fill, 1);
+        g.lineStyle(1.5, f.border, 1);
+        if (tk === "cavalry") {
+          g.fillEllipse(ox + 9, oy + 15, 17, 9);  g.strokeEllipse(ox + 9, oy + 15, 17, 9);   // 馬身
+          g.fillEllipse(ox + 16, oy + 11, 6, 5);                                              // 馬頭
+          g.fillCircle(ox + 7, oy + 7, 4);        g.strokeCircle(ox + 7, oy + 7, 4);          // 騎士
+          g.fillRect(ox + 1, oy + 19, 3, 4); g.fillRect(ox + 13, oy + 19, 3, 4);              // 馬腿
+        } else if (tk === "archer") {
+          g.fillRect(ox + 5, oy + 9, 8, 11);  g.strokeRect(ox + 5, oy + 9, 8, 11);            // 身
+          g.fillCircle(ox + 9, oy + 5, 4);    g.strokeCircle(ox + 9, oy + 5, 4);              // 頭
+          g.lineStyle(1.5, INK, 0.9);
+          g.beginPath(); g.arc(ox + 16, oy + 12, 7, -1.2, 1.2); g.strokePath();               // 弓
+          g.beginPath(); g.moveTo(ox + 16, oy + 5); g.lineTo(ox + 16, oy + 19); g.strokePath();
+        } else if (tk === "strategist") {
+          g.fillTriangle(ox + 9, oy + 4, ox + 2, oy + 21, ox + 16, oy + 21);                  // 長袍
+          g.lineStyle(1.5, f.border, 1);
+          g.strokeTriangle(ox + 9, oy + 4, ox + 2, oy + 21, ox + 16, oy + 21);
+          g.fillCircle(ox + 9, oy + 4, 3.5); g.strokeCircle(ox + 9, oy + 4, 3.5);             // 頭
+          g.fillStyle(0xf4edd8, 1).fillEllipse(ox + 16, oy + 10, 7, 4);                       // 羽扇
+          g.lineStyle(1, INK, 0.8).strokeEllipse(ox + 16, oy + 10, 7, 4);
+        } else { // infantry
+          g.fillRect(ox + 4, oy + 8, 10, 13); g.strokeRect(ox + 4, oy + 8, 10, 13);           // 身
+          g.fillCircle(ox + 9, oy + 4, 4);    g.strokeCircle(ox + 9, oy + 4, 4);              // 頭
+          g.lineStyle(1.5, INK, 0.9);
+          g.beginPath(); g.moveTo(ox + 17, oy - 2); g.lineTo(ox + 17, oy + 20); g.strokePath(); // 長槍
+          g.fillStyle(INK, 0.9).fillTriangle(ox + 15.5, oy - 2, ox + 18.5, oy - 2, ox + 17, oy - 6);
+        }
+        g.generateTexture(key, W, H);
+        g.destroy();
+      }
+    }
+  }
+
+  placeUnits() {
+    const pc = findTile(this.map, T.CASTLE_P), ec = findTile(this.map, T.CASTLE_E);
+    this.playerCastle = { x: pc[0], y: pc[1] };
+    this.enemyCastle = { x: ec[0], y: ec[1] };
+    const occupied = new Set();
+    const pSpawns = spawnPositions(this.map, pc[0], pc[1], 5, occupied);
+    const eSpawns = spawnPositions(this.map, ec[0], ec[1], 5, occupied);
+    ROSTERS[this.playerFaction].forEach((entry, i) => {
+      const s = pSpawns[i];
+      this.units.push(makeUnit(this.playerFaction, "player", entry, s.x, s.y));
     });
+    ROSTERS[this.enemyFaction].forEach((entry, i) => {
+      const s = eSpawns[i];
+      this.units.push(makeUnit(this.enemyFaction, "enemy", entry, s.x, s.y));
+    });
+    for (const u of this.units) this.createUnitView(u);
+  }
+
+  createUnitView(u) {
+    const { x, y } = this.tileCenter(u.x, u.y);
+    const img = this.add.image(0, -4, `unit_${u.faction}_${u.type}`);
+    if (u.side === "enemy") img.setFlipX(true);
+    const hpBg = this.add.rectangle(0, 14, 20, 3.5, 0x55430a, 0.85);
+    const hpBar = this.add.rectangle(-10, 14, 20, 3.5, 0x3a7a30, 1).setOrigin(0, 0.5);
+    const c = this.add.container(x, y, [img, hpBg, hpBar]);
+    c.setDepth(10 + u.y);
+    this.unitViews[u.id] = { c, img, hpBar };
+  }
+
+  refreshUnitView(u) {
+    const v = this.unitViews[u.id];
+    if (!v) return;
+    if (u.hp <= 0) { return; }
+    const ratio = Math.max(0, u.hp / u.maxHp);
+    v.hpBar.width = 20 * ratio;
+    v.hpBar.fillColor = ratio > 0.5 ? 0x3a7a30 : ratio > 0.25 ? 0xb08020 : 0xa03020;
+    v.img.setAlpha(u.acted && u.side === "player" ? 0.55 : 1);   // 已行動變灰
+  }
+
+  // ----- 介面 -----
+  buildUI() {
+    // 頂部橫條
+    this.add.rectangle(GAME_W / 2, 16, GAME_W, 32, PANEL, 0.92)
+      .setStrokeStyle(1, BORDER).setDepth(50);
+    this.topBarText = this.add.text(12, 7, "", {
+      fontSize: "14px", color: "#2c1a08", fontStyle: "bold",
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+    }).setDepth(51);
+    this.seedText = this.add.text(GAME_W - 10, 8, "", {
+      fontSize: "10px", color: "#8b7050", align: "right"
+    }).setOrigin(1, 0).setDepth(51);
+
+    // 底部資訊面板（選中單位資料）
+    this.infoPanel = this.add.rectangle(170, GAME_H - 52, 330, 92, PANEL, 0.95)
+      .setStrokeStyle(1.2, BORDER).setDepth(50);
+    this.infoText = this.add.text(18, GAME_H - 92, "", {
+      fontSize: "13px", color: "#2c1a08", lineSpacing: 4,
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+    }).setDepth(51);
+
+    // 結束回合按鈕（其餘行動按鈕 Phase 3 加入）
+    this.endBtn = this.makeButton(GAME_W - 80, GAME_H - 52, 130, 44, "結束回合 ⏎", () => {
+      if (!this.busy && this.turnSide === "player") this.endPlayerTurn();
+    });
+  }
+
+  makeButton(cx, cy, w, h, label, onClick) {
+    const r = this.add.rectangle(cx, cy, w, h, PANEL, 1)
+      .setStrokeStyle(1.5, BORDER).setDepth(50).setInteractive({ useHandCursor: true });
+    const t = this.add.text(cx, cy, label, {
+      fontSize: "15px", color: "#2c1a08", fontStyle: "bold",
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+    }).setOrigin(0.5).setDepth(51);
+    r.on("pointerover", () => r.setFillStyle(0xf6eed4));
+    r.on("pointerout", () => r.setFillStyle(PANEL));
+    r.on("pointerdown", e => { e.event && e.event.stopPropagation(); onClick(); });
+    return { r, t, setVisible(v) { r.setVisible(v); t.setVisible(v); }, setLabel(s) { t.setText(s); } };
+  }
+
+  refreshTopBar() {
+    const f = FACTIONS[this.playerFaction];
+    const turnLabel = this.turnSide === "player" ? "玩家回合" : "敵方回合";
+    this.topBarText.setText(`${f.name}軍　第 ${this.round} 回合　${turnLabel}　[${this.difficulty}]`);
+  }
+
+  showUnitInfo(u) {
+    if (!u) { this.infoText.setText(""); return; }
+    const tinfo = TERRAIN_INFO[this.map[u.y][u.x]];
+    const ab = u.ability ? `${u.ability}：${ABILITIES[u.ability].desc}` : "—";
+    this.infoText.setText(
+      `${FACTIONS[u.faction].name}・${u.general}（${TYPES[u.type].name}）  HP ${u.hp}/${u.maxHp}\n` +
+      `攻 ${u.atk}　防 ${u.def}　移 ${u.mov}　射程 ${effectiveRng(u)}　地形:${tinfo.name}\n` +
+      `技能：${ab}`
+    );
+  }
+
+  // ----- 輸入處理 -----
+  onPointer(p) {
+    if (this.busy || this.turnSide !== "player") return;
+    const t = this.xyToTile(p.worldX, p.worldY);
+    if (!t) return;
+    const u = unitAt(this.units, t.tx, t.ty);
+
+    // 點到可移動格 → 移動
+    if (this.selected && !this.selected.moved &&
+        this.moveSet.some(m => m.x === t.tx && m.y === t.ty)) {
+      this.doMove(this.selected, t.tx, t.ty);
+      return;
+    }
+    // 點到自己單位 → 選取
+    if (u && u.side === "player") {
+      this.selectUnit(u);
+      return;
+    }
+    if (u && u.side === "enemy") { this.showUnitInfo(u); return; }
+    this.deselect();
+  }
+
+  selectUnit(u) {
+    this.selected = u;
+    this.showUnitInfo(u);
+    this.moveSet = (!u.moved && !u.acted) ? reachableTiles(this.map, this.units, u) : [];
+    this.drawHighlights();
+  }
+
+  deselect() {
+    this.selected = null;
+    this.moveSet = [];
+    this.hlGfx.clear();
+    this.selGfx.clear();
+    this.showUnitInfo(null);
+  }
+
+  drawHighlights() {
+    this.hlGfx.clear();
+    this.selGfx.clear();
+    if (!this.selected) return;
+    // 藍色移動範圍
+    for (const m of this.moveSet) {
+      const { x, y } = this.tileToXY(m.x, m.y);
+      this.hlGfx.fillStyle(0x3a6a9a, 0.32).fillRect(x + 1, y + 1, TILE_W - 2, TILE_H - 2);
+      this.hlGfx.lineStyle(1, 0x3a6a9a, 0.7).strokeRect(x + 1.5, y + 1.5, TILE_W - 3, TILE_H - 3);
+    }
+    // 選取框
+    const { x, y } = this.tileToXY(this.selected.x, this.selected.y);
+    this.selGfx.lineStyle(2, 0xb03020, 0.95).strokeRect(x + 2, y + 2, TILE_W - 4, TILE_H - 4);
+  }
+
+  doMove(u, tx, ty) {
+    this.busy = true;
+    u.x = tx; u.y = ty; u.moved = true;
+    const v = this.unitViews[u.id];
+    const { x, y } = this.tileCenter(tx, ty);
+    this.hlGfx.clear();
+    this.tweens.add({
+      targets: v.c, x, y, duration: 220, ease: "Power2",
+      onComplete: () => {
+        v.c.setDepth(10 + ty);
+        this.busy = false;
+        this.afterMove(u);
+      }
+    });
+  }
+
+  // Phase 3 擴充：移動後顯示攻擊選項
+  afterMove(u) {
+    u.acted = true;            // Phase 3 改為可攻擊後才結束
+    this.refreshUnitView(u);
+    this.selectUnit(u);
+    this.drawHighlights();
+    this.showUnitInfo(u);
+  }
+
+  endPlayerTurn() {
+    this.deselect();
+    this.turnSide = "enemy";
+    this.refreshTopBar();
+    // Phase 4 加入 AI；目前敵方直接跳過
+    this.time.delayedCall(400, () => this.startPlayerTurn());
+  }
+
+  startPlayerTurn() {
+    this.round++;
+    this.turnSide = "player";
+    for (const u of livingUnits(this.units)) {
+      if (u.cooldown > 0 && u.side === "player") u.cooldown--;
+      if (u.atkDebuff > 0) u.atkDebuff--;
+      u.moved = false; u.acted = false;
+      this.refreshUnitView(u);
+    }
+    this.refreshTopBar();
   }
 
   // ----- 座標轉換 -----
