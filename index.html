@@ -209,6 +209,19 @@ function targetsInRange(units, unit, fromX, fromY) {
     t.side !== unit.side && manhattan(fromX, fromY, t.x, t.y) <= rng);
 }
 
+// 戰鬥傷害：ATK - DEF + 地形加成；樹林迴避 MISS；10% 暴擊 x1.5
+function computeDamage(attacker, defender, map, rand) {
+  const dTerrain = TERRAIN_INFO[map[defender.y][defender.x]];
+  if (rand() * 100 < dTerrain.evade) return { miss: true, crit: false, dmg: 0 };
+  let atk = attacker.atk;
+  if (attacker.ability === "武聖" && attacker.hp < attacker.maxHp * 0.5) atk *= 1.3; // 武聖
+  if (attacker.atkDebuff > 0) atk *= 0.7;   // 弱化
+  const crit = rand() < 0.10;
+  let dmg = atk - (defender.def + dTerrain.def);
+  if (crit) dmg *= 1.5;
+  return { miss: false, crit, dmg: Math.max(1, Math.round(dmg)) };
+}
+
 // 城池附近出兵點：BFS 由城池向外找可站立格
 function spawnPositions(map, castleX, castleY, n, occupied) {
   const seen = new Set([castleX + "," + castleY]);
@@ -254,9 +267,11 @@ class BattleScene extends Phaser.Scene {
     this.unitViews = {};        // unit.id -> container
     this.selected = null;
     this.moveSet = [];          // 可移動格
+    this.attackSet = [];        // 可攻擊目標
     this.round = 1;
     this.turnSide = "player";
     this.busy = false;          // 動畫/敵方回合中鎖輸入
+    this.battleOver = false;
   }
 
   create() {
@@ -269,7 +284,7 @@ class BattleScene extends Phaser.Scene {
     this.buildUI();
     this.input.on("pointerdown", p => this.onPointer(p));
     this.input.keyboard.on("keydown-ESC", () => this.deselect());
-    this.input.keyboard.on("keydown-ENTER", () => { if (!this.busy && this.turnSide === "player") this.endPlayerTurn(); });
+    this.input.keyboard.on("keydown-ENTER", () => { if (!this.busy && this.turnSide === "player" && !this.battleOver) this.endPlayerTurn(); });
     this.refreshTopBar();
   }
 
@@ -380,10 +395,15 @@ class BattleScene extends Phaser.Scene {
       fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
     }).setDepth(51);
 
-    // 結束回合按鈕（其餘行動按鈕 Phase 3 加入）
+    // 結束回合按鈕
     this.endBtn = this.makeButton(GAME_W - 80, GAME_H - 52, 130, 44, "結束回合 ⏎", () => {
-      if (!this.busy && this.turnSide === "player") this.endPlayerTurn();
+      if (!this.busy && this.turnSide === "player" && !this.battleOver) this.endPlayerTurn();
     });
+    // 待機按鈕：選中單位放棄攻擊直接結束行動
+    this.waitBtn = this.makeButton(GAME_W - 80, GAME_H - 102, 130, 38, "待機", () => {
+      if (!this.busy && this.selected && !this.selected.acted) this.finishUnit(this.selected);
+    });
+    this.waitBtn.setVisible(false);
   }
 
   makeButton(cx, cy, w, h, label, onClick) {
@@ -418,11 +438,17 @@ class BattleScene extends Phaser.Scene {
 
   // ----- 輸入處理 -----
   onPointer(p) {
-    if (this.busy || this.turnSide !== "player") return;
+    if (this.busy || this.turnSide !== "player" || this.battleOver) return;
     const t = this.xyToTile(p.worldX, p.worldY);
     if (!t) return;
     const u = unitAt(this.units, t.tx, t.ty);
 
+    // 點到攻擊範圍內敵人 → 攻擊
+    if (this.selected && !this.selected.acted && u &&
+        this.attackSet.some(a => a.id === u.id)) {
+      this.doAttack(this.selected, u);
+      return;
+    }
     // 點到可移動格 → 移動
     if (this.selected && !this.selected.moved &&
         this.moveSet.some(m => m.x === t.tx && m.y === t.ty)) {
@@ -442,15 +468,19 @@ class BattleScene extends Phaser.Scene {
     this.selected = u;
     this.showUnitInfo(u);
     this.moveSet = (!u.moved && !u.acted) ? reachableTiles(this.map, this.units, u) : [];
+    this.attackSet = !u.acted ? targetsInRange(this.units, u, u.x, u.y) : [];
     this.drawHighlights();
+    this.waitBtn.setVisible(!u.acted);
   }
 
   deselect() {
     this.selected = null;
     this.moveSet = [];
+    this.attackSet = [];
     this.hlGfx.clear();
     this.selGfx.clear();
     this.showUnitInfo(null);
+    this.waitBtn.setVisible(false);
   }
 
   drawHighlights() {
@@ -462,6 +492,12 @@ class BattleScene extends Phaser.Scene {
       const { x, y } = this.tileToXY(m.x, m.y);
       this.hlGfx.fillStyle(0x3a6a9a, 0.32).fillRect(x + 1, y + 1, TILE_W - 2, TILE_H - 2);
       this.hlGfx.lineStyle(1, 0x3a6a9a, 0.7).strokeRect(x + 1.5, y + 1.5, TILE_W - 3, TILE_H - 3);
+    }
+    // 紅色攻擊目標
+    for (const a of this.attackSet) {
+      const { x, y } = this.tileToXY(a.x, a.y);
+      this.hlGfx.fillStyle(0xb03020, 0.30).fillRect(x + 1, y + 1, TILE_W - 2, TILE_H - 2);
+      this.hlGfx.lineStyle(1.5, 0xb03020, 0.85).strokeRect(x + 1.5, y + 1.5, TILE_W - 3, TILE_H - 3);
     }
     // 選取框
     const { x, y } = this.tileToXY(this.selected.x, this.selected.y);
@@ -484,13 +520,98 @@ class BattleScene extends Phaser.Scene {
     });
   }
 
-  // Phase 3 擴充：移動後顯示攻擊選項
+  // 移動後：有目標就等玩家揀攻擊／待機，無目標自動結束行動
   afterMove(u) {
-    u.acted = true;            // Phase 3 改為可攻擊後才結束
-    this.refreshUnitView(u);
-    this.selectUnit(u);
+    this.attackSet = targetsInRange(this.units, u, u.x, u.y);
+    if (this.attackSet.length === 0) { this.finishUnit(u); return; }
+    this.moveSet = [];
     this.drawHighlights();
     this.showUnitInfo(u);
+    this.waitBtn.setVisible(true);
+  }
+
+  finishUnit(u) {
+    u.moved = true; u.acted = true;
+    this.refreshUnitView(u);
+    this.deselect();
+  }
+
+  doAttack(att, def) {
+    this.busy = true;
+    this.hlGfx.clear(); this.selGfx.clear();
+    this.waitBtn.setVisible(false);
+    const av = this.unitViews[att.id];
+    const home = this.tileCenter(att.x, att.y);
+    const tgt = this.tileCenter(def.x, def.y);
+    // 向目標衝刺 30% 距離再彈回
+    this.tweens.add({
+      targets: av.c,
+      x: home.x + (tgt.x - home.x) * 0.3,
+      y: home.y + (tgt.y - home.y) * 0.3,
+      duration: 110, yoyo: true, ease: "Power1",
+      onYoyo: () => this.applyHit(att, def),
+      onComplete: () => {
+        this.busy = false;
+        this.finishUnit(att);
+        this.checkBattleEnd();
+      }
+    });
+  }
+
+  applyHit(att, def) {
+    const r = computeDamage(att, def, this.map, Math.random);
+    const pos = this.tileCenter(def.x, def.y);
+    if (r.miss) { this.floatText(pos.x, pos.y - 14, "MISS", "#5a5a72", false); return; }
+    def.hp = Math.max(0, def.hp - r.dmg);
+    this.floatText(pos.x, pos.y - 14,
+      (r.crit ? "暴擊 -" : "-") + r.dmg,
+      r.crit ? "#c03010" : "#7a2010", r.crit);
+    this.refreshUnitView(def);
+    // 受擊閃白
+    const dv = this.unitViews[def.id];
+    if (dv) {
+      dv.img.setTintFill(0xffffff);
+      this.time.delayedCall(90, () => dv.img && dv.img.clearTint());
+      this.cameras.main.shake(80, 0.004);
+    }
+    if (def.hp <= 0) this.killUnit(def);
+  }
+
+  // 飄字：傷害數字向上飄並淡出
+  floatText(x, y, str, color, big) {
+    const t = this.add.text(x, y, str, {
+      fontSize: big ? "20px" : "16px", color, fontStyle: "bold",
+      stroke: "#f4edd8", strokeThickness: 3,
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+    }).setOrigin(0.5).setDepth(60);
+    this.tweens.add({
+      targets: t, y: y - 34, alpha: 0, duration: 850, ease: "Power1",
+      onComplete: () => t.destroy()
+    });
+  }
+
+  killUnit(u) {
+    const v = this.unitViews[u.id];
+    if (!v) return;
+    this.tweens.add({
+      targets: v.c, alpha: 0, y: v.c.y - 10, duration: 400, ease: "Power1",
+      onComplete: () => { v.c.destroy(); delete this.unitViews[u.id]; }
+    });
+  }
+
+  // 勝敗檢查（Phase 8 改為完整結算畫面）
+  checkBattleEnd() {
+    if (this.battleOver) return;
+    const pAlive = livingUnits(this.units, "player").length;
+    const eAlive = livingUnits(this.units, "enemy").length;
+    if (pAlive > 0 && eAlive > 0) return;
+    this.battleOver = true;
+    const win = eAlive === 0;
+    this.add.rectangle(GAME_W / 2, GAME_H / 2, GAME_W, 120, 0x2c1a08, 0.82).setDepth(70);
+    this.add.text(GAME_W / 2, GAME_H / 2, win ? "勝　利" : "敗　北", {
+      fontSize: "46px", color: win ? "#e8c070" : "#b0b0c0", fontStyle: "bold",
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+    }).setOrigin(0.5).setDepth(71);
   }
 
   endPlayerTurn() {
