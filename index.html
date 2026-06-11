@@ -57,8 +57,188 @@ const PARCHMENT = 0xf4edd8;            // 仿舊宣紙
 const PANEL = 0xece0c4;                // 面板宣紙色
 const BORDER = 0x8b7050;               // 格線顏色
 
-// ----- 載入畫面（Phaser 啟動前顯示） -----
-// 場景於後續 Phase 加入
+// [LOGIC-START] —— 純邏輯區（不依賴 Phaser / Tone，可供 node 測試）
+
+// ===== 地形系統 =====
+const T = { PLAIN:"plain", MOUNTAIN:"mountain", FOREST:"forest", RIVER:"river", CASTLE_P:"castle_p", CASTLE_E:"castle_e" };
+const TERRAIN_INFO = {
+  plain:    { name:"平原", def:0, evade:0,  cost:1,  passable:true  },
+  mountain: { name:"山地", def:0, evade:0,  cost:99, passable:false },
+  forest:   { name:"樹林", def:2, evade:15, cost:1,  passable:true  },
+  river:    { name:"河流", def:0, evade:0,  cost:2,  passable:true  },
+  castle_p: { name:"城池", def:5, evade:0,  cost:1,  passable:true  },
+  castle_e: { name:"城池", def:5, evade:0,  cost:1,  passable:true  }
+};
+const CHAR2T = { P:T.PLAIN, M:T.MOUNTAIN, F:T.FOREST, R:T.RIVER, "1":T.CASTLE_P, "2":T.CASTLE_E };
+
+// 測試地圖（Phase 7 改為隨機生成）
+const TEST_MAP_ROWS = [
+  "PPFFPPPPMMPP",
+  "PPPFPPPPPMPP",
+  "PPPPPRRPPPPP",
+  "PFPPPRRRPPFP",
+  "PPPPPPRRPPPP",
+  "P1PPPPRRPP2P",
+  "PPPPPRRPPPPP",
+  "PFPPPRPPPPFP",
+  "PPMPPPPPPFPP",
+  "PPMMPPPPPPPP"
+];
+function parseMap(rows) {
+  return rows.map(r => r.split("").map(c => CHAR2T[c] || T.PLAIN));
+}
+function findTile(map, t) {
+  for (let y = 0; y < map.length; y++)
+    for (let x = 0; x < map[0].length; x++)
+      if (map[y][x] === t) return [x, y];
+  return null;
+}
+
+// [LOGIC-END]
+
+// ============================================================
+// Phase 1 — 戰場場景：水墨側視地圖渲染
+// ============================================================
+class BattleScene extends Phaser.Scene {
+  constructor() { super("Battle"); }
+
+  init(data) {
+    this.map = parseMap(TEST_MAP_ROWS);   // Phase 7 改為隨機生成
+    this.riverTiles = [];
+    this.waveOffset = 0;
+  }
+
+  create() {
+    this.drawBackground();
+    this.drawMap();
+    // 頂部橫條（Phase 2+ 補充回合資訊）
+    this.topBarText = this.add.text(MAP_X + 2, 8, "三國水墨戰棋", {
+      fontSize: "16px", color: "#2c1a08", fontStyle: "bold",
+      fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
+    });
+  }
+
+  // ----- 座標轉換 -----
+  tileToXY(tx, ty) { return { x: MAP_X + tx * TILE_W, y: MAP_Y + ty * TILE_H }; }
+  tileCenter(tx, ty) { return { x: MAP_X + tx * TILE_W + TILE_W / 2, y: MAP_Y + ty * TILE_H + TILE_H / 2 }; }
+  xyToTile(px, py) {
+    const tx = Math.floor((px - MAP_X) / TILE_W), ty = Math.floor((py - MAP_Y) / TILE_H);
+    if (tx < 0 || tx >= COLS || ty < 0 || ty >= ROWS) return null;
+    return { tx, ty };
+  }
+
+  drawBackground() {
+    // 宣紙底 + 四角淡墨暈染
+    const g = this.add.graphics();
+    g.fillStyle(PARCHMENT, 1).fillRect(0, 0, GAME_W, GAME_H);
+    g.fillStyle(0xe6dcc0, 0.5);
+    g.fillEllipse(0, 0, 360, 220);
+    g.fillEllipse(GAME_W, GAME_H, 420, 260);
+    g.fillStyle(0xdfd4b4, 0.35);
+    g.fillEllipse(GAME_W, 0, 300, 180);
+  }
+
+  drawMap() {
+    const g = this.add.graphics();
+    this.riverTiles = [];
+    for (let y = 0; y < ROWS; y++) {
+      for (let x = 0; x < COLS; x++) {
+        this.drawTile(g, x, y, this.map[y][x]);
+      }
+    }
+    // 河流波紋獨立 Graphics，每幀重繪製造流動感
+    this.riverGfx = this.add.graphics();
+  }
+
+  drawTile(g, tx, ty, t) {
+    const { x, y } = this.tileToXY(tx, ty);
+    const baseColors = {
+      plain: 0xd4c9a8, mountain: 0xc0b690, forest: 0xb8c4a0,
+      river: 0xb0c4d0, castle_p: 0xd4c9a8, castle_e: 0xd4c9a8
+    };
+    // 底色塊（側視微凸效果：頂部亮 1px、底部 2px 深色陰影線）
+    g.fillStyle(baseColors[t], 1).fillRect(x, y, TILE_W, TILE_H);
+    g.lineStyle(0.8, BORDER, 0.9).strokeRect(x + 0.5, y + 0.5, TILE_W - 1, TILE_H - 1);
+    g.lineStyle(2, 0x9a8a68, 0.55);
+    g.beginPath(); g.moveTo(x + 1, y + TILE_H - 1); g.lineTo(x + TILE_W - 1, y + TILE_H - 1); g.strokePath();
+    g.lineStyle(1, 0xfaf4e0, 0.5);
+    g.beginPath(); g.moveTo(x + 1, y + 1); g.lineTo(x + TILE_W - 1, y + 1); g.strokePath();
+
+    if (t === T.MOUNTAIN) this.drawMountain(g, x, y);
+    else if (t === T.FOREST) this.drawForest(g, x, y, tx, ty);
+    else if (t === T.RIVER) this.riverTiles.push({ x, y });
+    else if (t === T.CASTLE_P || t === T.CASTLE_E) this.drawCastle(g, x, y, t === T.CASTLE_P);
+  }
+
+  drawMountain(g, x, y) {
+    // 2-3 個重疊三角峰，水墨色
+    const cx = x + TILE_W / 2, by = y + TILE_H - 6;
+    g.fillStyle(0x9a8a60, 1).fillTriangle(cx - 24, by, cx - 4, by, cx - 14, by - 26);
+    g.fillStyle(0x7a6a40, 1).fillTriangle(cx - 10, by, cx + 16, by, cx + 3, by - 32);
+    g.fillStyle(0x9a8a60, 0.9).fillTriangle(cx + 6, by, cx + 26, by, cx + 16, by - 20);
+    // 峰頂淡雪 + 墨線
+    g.fillStyle(0xf4edd8, 0.6).fillTriangle(cx - 1, by - 32, cx + 7, by - 32 + 8, cx - 6, by - 32 + 9);
+    g.lineStyle(1, INK, 0.5);
+    g.beginPath(); g.moveTo(cx + 3, by - 32); g.lineTo(cx + 16, by); g.strokePath();
+  }
+
+  drawForest(g, x, y, tx, ty) {
+    // 3-4 個墨點樹冠，交錯高度
+    const seeds = [(tx * 7 + ty * 13) % 5, (tx * 3 + ty * 11) % 7];
+    const pts = [
+      { dx: 14, dy: 22, r: 9 }, { dx: 30, dy: 14 + seeds[0], r: 11 },
+      { dx: 46, dy: 24, r: 8 }, { dx: 38 + seeds[1] % 4, dy: 30, r: 7 }
+    ];
+    for (const p of pts) {
+      // 樹幹
+      g.lineStyle(1.5, 0x4a3a20, 0.7);
+      g.beginPath(); g.moveTo(x + p.dx, y + p.dy + p.r - 2); g.lineTo(x + p.dx, y + TILE_H - 5); g.strokePath();
+      // 墨點樹冠（低 alpha 疊出層次）
+      g.fillStyle(0x508040, 0.55).fillEllipse(x + p.dx, y + p.dy, p.r * 2, p.r * 1.5);
+      g.fillStyle(0x3a6030, 0.4).fillEllipse(x + p.dx - 2, y + p.dy + 2, p.r * 1.4, p.r);
+    }
+  }
+
+  drawCastle(g, x, y, isPlayer) {
+    const wall = isPlayer ? 0xc8a060 : 0xc0b8d0;
+    const dark = isPlayer ? 0x8a6830 : 0x787090;
+    // 城牆主體
+    g.fillStyle(wall, 1).fillRect(x + 8, y + 14, TILE_W - 16, TILE_H - 20);
+    g.lineStyle(1, INK, 0.8).strokeRect(x + 8, y + 14, TILE_W - 16, TILE_H - 20);
+    // 城垛
+    for (let i = 0; i < 4; i++) {
+      g.fillStyle(dark, 1).fillRect(x + 10 + i * 12, y + 8, 8, 8);
+      g.lineStyle(1, INK, 0.6).strokeRect(x + 10 + i * 12, y + 8, 8, 8);
+    }
+    // 城門
+    g.fillStyle(0x3a2a10, 1).fillRect(x + TILE_W / 2 - 6, y + TILE_H - 18, 12, 12);
+    // 旗幟
+    g.lineStyle(1.5, INK, 0.9);
+    g.beginPath(); g.moveTo(x + TILE_W - 14, y + 2); g.lineTo(x + TILE_W - 14, y + 16); g.strokePath();
+    g.fillStyle(isPlayer ? 0xb03020 : 0x304080, 0.9).fillTriangle(
+      x + TILE_W - 14, y + 2, x + TILE_W - 14, y + 10, x + TILE_W - 2, y + 6);
+  }
+
+  update() {
+    // 河流波紋流動：三條正弦線，x 相位每幀 +0.3
+    if (!this.riverGfx) return;
+    this.waveOffset += 0.3;
+    const rg = this.riverGfx;
+    rg.clear();
+    rg.lineStyle(1.5, 0x3a6a8a, 0.75);
+    for (const rt of this.riverTiles) {
+      for (let line = 0; line < 3; line++) {
+        const baseY = rt.y + 10 + line * 13;
+        rg.beginPath();
+        for (let px = 4; px <= TILE_W - 4; px += 4) {
+          const wy = baseY + Math.sin((px + this.waveOffset + line * 17) / 7) * 2.2;
+          if (px === 4) rg.moveTo(rt.x + px, wy); else rg.lineTo(rt.x + px, wy);
+        }
+        rg.strokePath();
+      }
+    }
+  }
+}
 
 const config = {
   type: Phaser.AUTO,
@@ -72,7 +252,7 @@ const config = {
     min: { width: 320, height: 240 },
     max: { width: 1600, height: 1200 }
   },
-  scene: []   // 場景於各 Phase 註冊
+  scene: [BattleScene]   // Phase 8 加入 Title / Result
 };
 
 window.addEventListener("load", () => {
