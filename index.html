@@ -58,6 +58,10 @@ const PARCHMENT = 0xf4edd8;            // 仿舊宣紙
 const PANEL = 0xece0c4;                // 面板宣紙色
 const BORDER = 0x8b7050;               // 格線顏色
 
+// ===== Phase 6 — 手機偵測 =====
+const MOBILE = (typeof navigator !== "undefined") &&
+  (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768);
+
 // [LOGIC-START] —— 純邏輯區（不依賴 Phaser / Tone，可供 node 測試）
 
 // ===== 地形系統 =====
@@ -564,16 +568,81 @@ class BattleScene extends Phaser.Scene {
 
   create() {
     this.drawBackground();
+    // world 容器：地圖＋單位＋高亮，雙指縮放/拖動只作用於此層，UI 固定
+    this.world = this.add.container(0, 0);
     this.drawMap();
     this.makeUnitTextures();
     this.placeUnits();
-    this.hlGfx = this.add.graphics();        // 範圍高亮層
-    this.selGfx = this.add.graphics();       // 選取框
+    this.hlGfx = this.add.graphics().setDepth(2);   // 範圍高亮層
+    this.selGfx = this.add.graphics().setDepth(3);  // 選取框
+    this.world.add([this.hlGfx, this.selGfx]);
+    this.sortWorld();
     this.buildUI();
-    this.input.on("pointerdown", p => this.onPointer(p));
+
+    // 觸控輸入：tap 喺 pointerup 判定（同拖動/縮放區分）
+    this.input.addPointer(2);
+    this.lastPinch = null;
+    this.pinching = false;
+    this.input.on("pointerdown", p => {
+      this.downPos = { x: p.x, y: p.y };
+      this.dragDist = 0;
+      // 長按 500ms 顯示地形資訊
+      this.holdTimer = setTimeout(() => this.showTileInfoAt(p), 500);
+    });
+    this.input.on("pointermove", p => {
+      if (!p.isDown || this.pinching) return;
+      const dx = p.x - p.prevPosition.x, dy = p.y - p.prevPosition.y;
+      this.dragDist += Math.abs(dx) + Math.abs(dy);
+      if (this.dragDist > 12) clearTimeout(this.holdTimer);
+      // 放大後單指拖動地圖
+      if (this.world.scaleX > 1.001 && this.dragDist > 12) {
+        this.world.x += dx; this.world.y += dy;
+        this.clampWorld();
+      }
+    });
+    this.input.on("pointerup", p => {
+      clearTimeout(this.holdTimer);
+      if (this.pinching) { if (!this.input.pointer1.isDown && !this.input.pointer2.isDown) this.pinching = false; return; }
+      if (this.dragDist > 12) return;   // 拖動唔當 tap
+      this.onPointer(p);
+    });
     this.input.keyboard.on("keydown-ESC", () => this.deselect());
     this.input.keyboard.on("keydown-ENTER", () => { if (!this.busy && this.turnSide === "player" && !this.battleOver) this.endPlayerTurn(); });
     this.refreshTopBar();
+  }
+
+  // container 子物件按 depth 排序（容器內 depth 唔會自動生效）
+  sortWorld() { this.world.sort("depth"); }
+
+  // 世界座標（縮放/拖動後）→ 地圖邏輯座標
+  worldPoint(p) {
+    return { x: (p.x - this.world.x) / this.world.scaleX, y: (p.y - this.world.y) / this.world.scaleY };
+  }
+
+  setWorldZoom(s, cx, cy) {
+    const old = this.world.scaleX;
+    s = Phaser.Math.Clamp(s, 1, 2.5);
+    this.world.x = cx - (cx - this.world.x) * (s / old);
+    this.world.y = cy - (cy - this.world.y) * (s / old);
+    this.world.setScale(s);
+    this.clampWorld();
+  }
+
+  clampWorld() {
+    const s = this.world.scaleX;
+    const w = (MAP_X * 2 + COLS * TILE_W) * s, h = (MAP_Y + ROWS * TILE_H + 8) * s;
+    this.world.x = Phaser.Math.Clamp(this.world.x, Math.min(0, GAME_W - w), 0);
+    this.world.y = Phaser.Math.Clamp(this.world.y, Math.min(0, GAME_H - h), 0);
+  }
+
+  // 長按：顯示格仔地形資訊
+  showTileInfoAt(p) {
+    const wp = this.worldPoint(p);
+    const t = this.xyToTile(wp.x, wp.y);
+    if (!t) return;
+    const info = TERRAIN_INFO[this.map[t.ty][t.tx]];
+    this.setInfoText(`【${info.name}】 防禦加成 +${info.def}　迴避 ${info.evade}%　移動消耗 ${info.cost > 10 ? "不可通行" : info.cost}`);
+    this.slideInfoIn();
   }
 
   // ----- 單位材質：18x22 剪影 + 三角軍旗，全 Graphics 生成 -----
@@ -649,6 +718,7 @@ class BattleScene extends Phaser.Scene {
     const hpBar = this.add.rectangle(-10, 14, 20, 3.5, 0x3a7a30, 1).setOrigin(0, 0.5);
     const c = this.add.container(x, y, [img, hpBg, hpBar]);
     c.setDepth(10 + u.y);
+    this.world.add(c);
     this.unitViews[u.id] = { c, img, hpBar };
   }
 
@@ -675,33 +745,58 @@ class BattleScene extends Phaser.Scene {
       fontSize: "10px", color: "#8b7050", align: "right"
     }).setOrigin(1, 0).setDepth(51);
 
-    // 底部資訊面板（選中單位資料）
-    this.infoPanel = this.add.rectangle(170, GAME_H - 52, 330, 92, PANEL, 0.95)
-      .setStrokeStyle(1.2, BORDER).setDepth(50);
-    this.infoText = this.add.text(18, GAME_H - 92, "", {
-      fontSize: "13px", color: "#2c1a08", lineSpacing: 4,
+    // 底部資訊面板（容器：手機版由底部滑出，桌面版固定顯示）
+    const panelW = MOBILE ? GAME_W : 330, panelH = MOBILE ? 100 : 92;
+    const panelX = MOBILE ? GAME_W / 2 : 170;
+    this.infoHomeY = GAME_H - 52;
+    this.infoPanelC = this.add.container(0, 0).setDepth(50);
+    const panelBg = this.add.rectangle(panelX, this.infoHomeY, panelW, panelH, PANEL, 0.95)
+      .setStrokeStyle(1.2, BORDER);
+    this.infoText = this.add.text(MOBILE ? 16 : 18, this.infoHomeY - panelH / 2 + 10, "", {
+      fontSize: MOBILE ? "14px" : "13px",       // 手機最少 14px
+      color: "#2c1a08", lineSpacing: 4,
       fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
-    }).setDepth(51);
+    });
+    this.infoPanelC.add([panelBg, this.infoText]);
+    if (MOBILE) this.infoPanelC.y = 130;        // 收埋喺畫面下方
 
-    // 結束回合按鈕
-    this.endBtn = this.makeButton(GAME_W - 80, GAME_H - 52, 130, 44, "結束回合 ⏎", () => {
-      if (!this.busy && this.turnSide === "player" && !this.battleOver) this.endPlayerTurn();
-    });
-    // 待機按鈕：選中單位放棄攻擊直接結束行動
-    this.waitBtn = this.makeButton(GAME_W - 80, GAME_H - 102, 130, 38, "待機", () => {
-      if (!this.busy && this.selected && !this.selected.acted) this.finishUnit(this.selected);
-    });
-    this.waitBtn.setVisible(false);
-    // 技能按鈕：主動技（空城計／火攻／弱化）
-    this.abilityBtn = this.makeButton(GAME_W - 80, GAME_H - 146, 130, 38, "技能", () => {
+    const onEnd = () => { if (!this.busy && this.turnSide === "player" && !this.battleOver) this.endPlayerTurn(); };
+    const onWait = () => { if (!this.busy && this.selected && !this.selected.acted) this.finishUnit(this.selected); };
+    const onAbility = () => {
       const u = this.selected;
       if (!this.busy && u && !u.acted && canUseAbility(u)) {
         this.castAbility(u);
         if (!this.battleOver) this.deselect();
       }
-    });
+    };
+    if (MOBILE) {
+      // 手機版：右下 2x2 大按鈕（80x70），點擊區域大過 44px
+      const bw = 80, bh = 70, gap = 6;
+      const x0 = GAME_W - bw * 1.5 - gap - 8, x1 = GAME_W - bw / 2 - 8;
+      const y0 = GAME_H - bh * 1.5 - gap - 8, y1 = GAME_H - bh / 2 - 8;
+      this.abilityBtn = this.makeButton(x0, y0, bw, bh, "技能", onAbility);
+      this.waitBtn = this.makeButton(x1, y0, bw, bh, "待機", onWait);
+      this.endBtn = this.makeButton((x0 + x1) / 2, y1, bw * 2 + gap, bh, "結束回合", onEnd);
+    } else {
+      // 桌面版：右下直排（最少 44px 高，符合觸控標準）
+      this.endBtn = this.makeButton(GAME_W - 80, GAME_H - 52, 130, 44, "結束回合 ⏎", onEnd);
+      this.waitBtn = this.makeButton(GAME_W - 80, GAME_H - 102, 130, 44, "待機", onWait);
+      this.abilityBtn = this.makeButton(GAME_W - 80, GAME_H - 152, 130, 44, "技能", onAbility);
+    }
+    this.waitBtn.setVisible(false);
     this.abilityBtn.setVisible(false);
   }
+
+  // 資訊面板滑入／滑出（手機版）
+  slideInfoIn() {
+    if (!MOBILE) return;
+    this.tweens.add({ targets: this.infoPanelC, y: 0, duration: 200, ease: "Power2" });
+  }
+  slideInfoOut() {
+    if (!MOBILE) return;
+    this.tweens.add({ targets: this.infoPanelC, y: 130, duration: 200, ease: "Power2" });
+  }
+  setInfoText(s) { this.infoText.setText(s); }
 
   makeButton(cx, cy, w, h, label, onClick) {
     const r = this.add.rectangle(cx, cy, w, h, PANEL, 1)
@@ -723,21 +818,23 @@ class BattleScene extends Phaser.Scene {
   }
 
   showUnitInfo(u) {
-    if (!u) { this.infoText.setText(""); return; }
+    if (!u) { this.setInfoText(""); this.slideInfoOut(); return; }
     const tinfo = TERRAIN_INFO[this.map[u.y][u.x]];
     const ab = u.ability ? `${u.ability}：${ABILITIES[u.ability].desc}` : "—";
-    this.infoText.setText(
+    this.setInfoText(
       `${FACTIONS[u.faction].name}・${u.general}（${TYPES[u.type].name}）  HP ${u.hp}/${u.maxHp}\n` +
       `攻 ${u.atk}　防 ${u.def}　移 ${u.mov}　射程 ${effectiveRng(u)}　地形:${tinfo.name}\n` +
       `技能：${ab}`
     );
+    this.slideInfoIn();
   }
 
   // ----- 輸入處理 -----
   onPointer(p) {
     if (this.busy || this.turnSide !== "player" || this.battleOver) return;
-    const t = this.xyToTile(p.worldX, p.worldY);
-    if (!t) return;
+    const wp = this.worldPoint(p);
+    const t = this.xyToTile(wp.x, wp.y);
+    if (!t) { this.deselect(); return; }
     const u = unitAt(this.units, t.tx, t.ty);
 
     // 點到攻擊範圍內敵人 → 攻擊
@@ -816,6 +913,7 @@ class BattleScene extends Phaser.Scene {
       targets: v.c, x, y, duration: 220, ease: "Power2",
       onComplete: () => {
         v.c.setDepth(10 + ty);
+        this.sortWorld();
         this.busy = false;
         this.afterMove(u);
       }
@@ -893,6 +991,8 @@ class BattleScene extends Phaser.Scene {
       stroke: "#f4edd8", strokeThickness: 3,
       fontFamily: '"PingFang TC","Microsoft JhengHei",serif'
     }).setOrigin(0.5).setDepth(60);
+    this.world.add(t);
+    this.sortWorld();
     this.tweens.add({
       targets: t, y: y - 34, alpha: 0, duration: 850, ease: "Power1",
       onComplete: () => t.destroy()
@@ -985,7 +1085,7 @@ class BattleScene extends Phaser.Scene {
       const { x, y } = this.tileCenter(u.x, u.y);
       this.tweens.add({
         targets: v.c, x, y, duration: 300, ease: "Power2",
-        onComplete: () => { v.c.setDepth(10 + u.y); this.checkBattleEnd(); if (!this.battleOver) afterMovePart(); }
+        onComplete: () => { v.c.setDepth(10 + u.y); this.sortWorld(); this.checkBattleEnd(); if (!this.battleOver) afterMovePart(); }
       });
     } else afterMovePart();
   }
@@ -1065,7 +1165,7 @@ class BattleScene extends Phaser.Scene {
   }
 
   drawMap() {
-    const g = this.add.graphics();
+    const g = this.add.graphics().setDepth(0);
     this.riverTiles = [];
     for (let y = 0; y < ROWS; y++) {
       for (let x = 0; x < COLS; x++) {
@@ -1073,7 +1173,8 @@ class BattleScene extends Phaser.Scene {
       }
     }
     // 河流波紋獨立 Graphics，每幀重繪製造流動感
-    this.riverGfx = this.add.graphics();
+    this.riverGfx = this.add.graphics().setDepth(1);
+    this.world.add([g, this.riverGfx]);
   }
 
   drawTile(g, tx, ty, t) {
@@ -1146,6 +1247,20 @@ class BattleScene extends Phaser.Scene {
   }
 
   update() {
+    // 雙指縮放（pinch-to-zoom）
+    const p1 = this.input.pointer1, p2 = this.input.pointer2;
+    if (p1 && p2 && p1.isDown && p2.isDown) {
+      this.pinching = true;
+      clearTimeout(this.holdTimer);
+      const d = Phaser.Math.Distance.Between(p1.x, p1.y, p2.x, p2.y);
+      if (this.lastPinch) {
+        this.setWorldZoom(this.world.scaleX * (d / this.lastPinch), (p1.x + p2.x) / 2, (p1.y + p2.y) / 2);
+      }
+      this.lastPinch = d;
+    } else {
+      this.lastPinch = null;
+    }
+
     // 河流波紋流動：三條正弦線，x 相位每幀 +0.3
     if (!this.riverGfx) return;
     this.waveOffset += 0.3;
