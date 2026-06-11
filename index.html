@@ -35,6 +35,7 @@
 </style>
 <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.7.77/Tone.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/mneubrand/jsfxr/sfxr.js"></script>
 </head>
 <body>
 <div id="game-container"></div>
@@ -444,6 +445,97 @@ function shouldUseAbility(map, units, unit) {
 // [LOGIC-END]
 
 // ============================================================
+// Phase 5 — 音效系統：Tone.js（旋律）+ jsfxr（戰鬥）8-bit 音色
+// ============================================================
+const SFX = {
+  ready: false,
+  bgmStarted: false,
+  init() {
+    if (this.ready || typeof Tone === "undefined") return;
+    this.ready = true;
+    // 主音色 — NES 方波
+    this.lead = new Tone.Synth({ oscillator: { type: "square" },
+      envelope: { attack: 0.001, decay: 0.1, sustain: 0, release: 0.1 }, volume: -8 }).toDestination();
+    // UI / 移動 — 三角波
+    this.tri = new Tone.Synth({ oscillator: { type: "triangle" },
+      envelope: { attack: 0.001, decay: 0.05, sustain: 0, release: 0.05 }, volume: -6 }).toDestination();
+    // 低音 — 敗北旋律
+    this.bass = new Tone.Synth({ oscillator: { type: "sawtooth" },
+      envelope: { attack: 0.001, decay: 0.2, sustain: 0.1, release: 0.2 }, volume: -8 }).toDestination();
+    // 回合鼓聲
+    this.metal = new Tone.MetalSynth({ envelope: { attack: 0.001, decay: 0.4, release: 0.2 },
+      harmonicity: 5.1, modulationIndex: 32, resonance: 4000, octaves: 1.5, volume: -16 }).toDestination();
+    // jsfxr 失敗時的噪聲回退
+    this.noise = new Tone.NoiseSynth({ noise: { type: "white" },
+      envelope: { attack: 0.001, decay: 0.15, sustain: 0 }, volume: -12 }).toDestination();
+  },
+  // jsfxr 預設參數音效；不可用時回退 Tone
+  fx(params, fallback) {
+    try {
+      if (typeof jsfxr === "function") {
+        const a = new Audio();
+        a.volume = 0.45;
+        a.src = jsfxr(params);
+        a.play();
+        return;
+      }
+    } catch (e) { /* 回退 Tone */ }
+    if (this.ready && fallback) fallback();
+  },
+  hit() {        // 戰鬥攻擊（HIT type）
+    this.fx([3,,0.0918,,0.1762,0.7,,-0.5,,,,,,,,,,,1,,,0.2,,0.45],
+      () => this.noise.triggerAttackRelease("16n"));
+  },
+  explosion() {  // 單位陣亡／城池陷落（EXPLOSION type）
+    this.fx([3,,0.32,0.52,0.42,0.09,,,,,,,,,,0.6,,,1,,,,,0.5],
+      () => { this.noise.triggerAttackRelease("8n"); this.metal.triggerAttackRelease("C2", "8n"); });
+  },
+  powerup() {    // 武將技能（POWERUP type）
+    this.fx([0,,0.22,,0.42,0.55,,0.22,,,,,,0.35,,,,,1,,,,,0.45],
+      () => ["C5","E5","G5"].forEach((n, i) => this.lead.triggerAttackRelease(n, "16n", Tone.now() + i * 0.07)));
+  },
+  select() { if (this.ready) this.tri.triggerAttackRelease(880, 0.08); },   // UI 選擇 880Hz 80ms
+  move()   { if (this.ready) this.tri.triggerAttackRelease("E4", "32n"); },
+  miss()   { if (this.ready) this.tri.triggerAttackRelease("A3", "32n"); },
+  roundStart() { if (this.ready) this.metal.triggerAttackRelease("C3", "16n"); },
+  victory() {    // 五聲音階上行
+    if (!this.ready) return;
+    this.stopBGM();
+    ["D4","F#4","A4","D5"].forEach((n, i) => this.lead.triggerAttackRelease(n, "8n", Tone.now() + i * 0.15));
+  },
+  defeat() {     // 下降小調
+    if (!this.ready) return;
+    this.stopBGM();
+    ["D4","C4","Bb3","G3"].forEach((n, i) => this.bass.triggerAttackRelease(n, "4n", Tone.now() + i * 0.3));
+  },
+  startBGM() {   // 五聲音階循環，square detune -10
+    if (!this.ready || this.bgmStarted) return;
+    this.bgmStarted = true;
+    this.bgSynth = new Tone.Synth({ oscillator: { type: "square", detune: -10 },
+      envelope: { attack: 0.001, decay: 0.2, sustain: 0.1, release: 0.1 }, volume: -18 }).toDestination();
+    const notes = ["D3","F#3","A3","D3","A3","F#3","D3","E3"];
+    let i = 0;
+    this.bgmLoop = Tone.Transport.scheduleRepeat(t => {
+      this.bgSynth.triggerAttackRelease(notes[i % notes.length], "8n", t);
+      i++;
+    }, "8n");
+    Tone.Transport.start();
+  },
+  stopBGM() {
+    if (this.bgmLoop !== undefined) {
+      Tone.Transport.clear(this.bgmLoop);
+      this.bgmLoop = undefined;
+      this.bgmStarted = false;
+    }
+  }
+};
+// 瀏覽器要求 user gesture 後先可以啟動 AudioContext
+document.addEventListener("pointerdown", () => {
+  if (typeof Tone !== "undefined")
+    Tone.start().then(() => { SFX.init(); SFX.startBGM(); });
+}, { once: true });
+
+// ============================================================
 // Phase 1 — 戰場場景：水墨側視地圖渲染
 // ============================================================
 class BattleScene extends Phaser.Scene {
@@ -670,6 +762,7 @@ class BattleScene extends Phaser.Scene {
   }
 
   selectUnit(u) {
+    SFX.select();
     this.selected = u;
     this.showUnitInfo(u);
     this.moveSet = (!u.moved && !u.acted) ? reachableTiles(this.map, this.units, u) : [];
@@ -713,6 +806,7 @@ class BattleScene extends Phaser.Scene {
   }
 
   doMove(u, tx, ty) {
+    SFX.move();
     this.busy = true;
     u.x = tx; u.y = ty; u.moved = true;
     const v = this.unitViews[u.id];
@@ -775,7 +869,8 @@ class BattleScene extends Phaser.Scene {
   applyHit(att, def) {
     const r = computeDamage(att, def, this.map, Math.random);
     const pos = this.tileCenter(def.x, def.y);
-    if (r.miss) { this.floatText(pos.x, pos.y - 14, "MISS", "#5a5a72", false); return; }
+    if (r.miss) { SFX.miss(); this.floatText(pos.x, pos.y - 14, "MISS", "#5a5a72", false); return; }
+    SFX.hit();
     def.hp = Math.max(0, def.hp - r.dmg);
     this.floatText(pos.x, pos.y - 14,
       (r.crit ? "暴擊 -" : "-") + r.dmg,
@@ -805,6 +900,7 @@ class BattleScene extends Phaser.Scene {
   }
 
   killUnit(u) {
+    SFX.explosion();
     const v = this.unitViews[u.id];
     if (!v) return;
     this.tweens.add({
@@ -824,6 +920,7 @@ class BattleScene extends Phaser.Scene {
     const lose = pAlive === 0 || (pCastleOcc && pCastleOcc.side === "enemy");
     if (!win && !lose) return;
     this.battleOver = true;
+    if (win) SFX.victory(); else SFX.defeat();
     this.add.rectangle(GAME_W / 2, GAME_H / 2, GAME_W, 120, 0x2c1a08, 0.82).setDepth(70);
     this.add.text(GAME_W / 2, GAME_H / 2, win ? "勝　利" : "敗　北", {
       fontSize: "46px", color: win ? "#e8c070" : "#b0b0c0", fontStyle: "bold",
@@ -895,6 +992,7 @@ class BattleScene extends Phaser.Scene {
 
   // ----- 主動技能（玩家／AI 共用）-----
   castAbility(u) {
+    SFX.powerup();
     const pos = this.tileCenter(u.x, u.y);
     const adj = livingUnits(this.units).filter(t => t.side !== u.side &&
       Math.max(Math.abs(t.x - u.x), Math.abs(t.y - u.y)) === 1);
@@ -930,6 +1028,7 @@ class BattleScene extends Phaser.Scene {
     if (this.battleOver) return;
     this.round++;
     this.turnSide = "player";
+    SFX.roundStart();
     for (const u of livingUnits(this.units, "player")) {
       if (u.cooldown > 0) u.cooldown--;
       if (u.atkDebuff > 0) u.atkDebuff--;
