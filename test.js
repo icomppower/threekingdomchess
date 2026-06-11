@@ -13,7 +13,9 @@ const exportsList = [
   "computeDamage", "spawnPositions",
   "expectedDamage", "enumerateActions", "buildThreatMap", "scoreAction",
   "applyActionSim", "evaluateBoard", "chooseAction", "shouldUseAbility",
-  "canUseAbility", "countAdjacentEnemies"
+  "canUseAbility", "countAdjacentEnemies",
+  "seededRandom", "getTileWeights", "generateMap", "isConnectedMap",
+  "generateFallbackMap", "getRoundSeed"
 ];
 const L = new Function(prelude + m[1] + `; return { ${exportsList.join(", ")} };`)();
 
@@ -163,6 +165,58 @@ for (const diff of ["守將", "謀士", "軍師"]) {
   const guanyu2 = L.makeUnit("shu", "player", { general: "關羽", type: "infantry", ability: "武聖" }, 2, 2);
   assert(L.canUseAbility(guanyu2) === false, "被動技不可主動使用");
 }
+
+// ===== Phase 7 — 隨機地圖生成 =====
+// 同一 seed 生成相同地圖
+{
+  const a = L.generateMap(1001, 12, 10, "謀士");
+  const b = L.generateMap(1001, 12, 10, "謀士");
+  assert(JSON.stringify(a.map) === JSON.stringify(b.map), "同一 seed 地圖完全相同");
+  const c = L.generateMap(7777, 12, 10, "謀士");
+  assert(JSON.stringify(a.map) !== JSON.stringify(c.map), "唔同 seed 地圖唔同");
+}
+
+// 三個固定 seed × 三難度全部連通 + 規則檢查
+for (const seed of [1001, 2002, 3003]) {
+  for (const diff of ["守將", "謀士", "軍師"]) {
+    const { map: m } = L.generateMap(seed, 12, 10, diff);
+    assert(L.isConnectedMap(m), `seed ${seed} ${diff}：兩城池 BFS 連通`);
+    // 河流只可以橫向或縱向
+    let riverOk = true;
+    for (let y = 0; y < 10; y++) for (let x = 0; x < 12; x++) {
+      if (m[y][x] !== L.T.RIVER) continue;
+      const hasH = m[y][x - 1] === L.T.RIVER || m[y][x + 1] === L.T.RIVER;
+      const hasV = (m[y - 1] && m[y - 1][x] === L.T.RIVER) || (m[y + 1] && m[y + 1][x] === L.T.RIVER);
+      if (!hasH && !hasV) riverOk = false;
+    }
+    assert(riverOk, `seed ${seed} ${diff}：河流無孤立斜格`);
+    // 城池周圍 1 格平原
+    const pc = L.findTile(m, L.T.CASTLE_P), ec = L.findTile(m, L.T.CASTLE_E);
+    let ringOk = pc[0] === 1 && ec[0] === 10;
+    for (const [cx, cy] of [pc, ec]) {
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        if (!dx && !dy) continue;
+        const t = m[cy + dy] && m[cy + dy][cx + dx];
+        if (t && t !== L.T.PLAIN) ringOk = false;
+      }
+    }
+    assert(ringOk, `seed ${seed} ${diff}：城池位置正確且周圍平原`);
+  }
+}
+
+// 隨機 seed 抽查 30 個都連通（生成器永遠俾到可玩地圖）
+{
+  let allOk = true;
+  for (let i = 0; i < 30; i++) {
+    const s = Math.floor(Math.random() * 99999);
+    if (!L.isConnectedMap(L.generateMap(s, 12, 10, "軍師").map)) allOk = false;
+  }
+  assert(allOk, "隨機 30 個 seed（軍師高障礙）全部連通");
+}
+
+// 備用地圖連通；固定關卡 seed 正確
+assert(L.isConnectedMap(L.generateFallbackMap(12, 10)), "備用地圖連通");
+assert(L.getRoundSeed(1) === 1001 && L.getRoundSeed(2) === 2002 && L.getRoundSeed(3) === 3003, "前三關固定 seed");
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

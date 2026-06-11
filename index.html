@@ -421,6 +421,144 @@ function chooseAction(map, units, unit, difficulty, castles, deadline) {
   return best;
 }
 
+// ===== Phase 7 — 隨機地圖生成（Cellular Automata + BFS 連通檢查）=====
+
+// Seeded 隨機數生成器：同一 seed 永遠生成同一地圖
+function seededRandom(seed) {
+  let s = Math.abs(Math.floor(seed)) % 233280;
+  return function () {
+    s = (s * 9301 + 49297) % 233280;
+    return s / 233280;
+  };
+}
+
+// 地形比例按難度調整
+function getTileWeights(difficulty) {
+  return {
+    "守將": { mountain: 0.10, forest: 0.15, river: 0.05 },
+    "謀士": { mountain: 0.20, forest: 0.15, river: 0.10 },
+    "軍師": { mountain: 0.30, forest: 0.20, river: 0.15 }
+  }[difficulty] || { mountain: 0.20, forest: 0.15, river: 0.10 };
+}
+
+// 第一步：隨機填充
+function generateRawMap(seed, cols, rows, w) {
+  const rng = seededRandom(seed);
+  const map = [];
+  for (let y = 0; y < rows; y++) {
+    map[y] = [];
+    for (let x = 0; x < cols; x++) {
+      const r = rng();
+      if (r < w.mountain) map[y][x] = T.MOUNTAIN;
+      else if (r < w.mountain + w.forest) map[y][x] = T.FOREST;
+      else if (r < w.mountain + w.forest + w.river) map[y][x] = T.RIVER;
+      else map[y][x] = T.PLAIN;
+    }
+  }
+  return map;
+}
+
+// 第二步：Cellular Automata smoothing（跑 3 次，8 鄰域 5+ 同類就同化）
+function smoothMap(map, iterations) {
+  iterations = iterations || 3;
+  for (let it = 0; it < iterations; it++) {
+    const next = map.map(r => r.slice());
+    for (let y = 1; y < map.length - 1; y++) {
+      for (let x = 1; x < map[0].length - 1; x++) {
+        const counts = {};
+        for (let dy = -1; dy <= 1; dy++)
+          for (let dx = -1; dx <= 1; dx++) {
+            if (!dx && !dy) continue;
+            const t = map[y + dy][x + dx];
+            counts[t] = (counts[t] || 0) + 1;
+          }
+        let dominant = null, max = 0;
+        for (const t in counts) if (counts[t] > max) { max = counts[t]; dominant = t; }
+        if (max >= 5) next[y][x] = dominant;
+      }
+    }
+    map = next;
+  }
+  return map;
+}
+
+// 第三步：河流只可以橫向或縱向，孤立河流變平原
+function fixRivers(map) {
+  for (let y = 0; y < map.length; y++) {
+    for (let x = 0; x < map[0].length; x++) {
+      if (map[y][x] !== T.RIVER) continue;
+      const hasH = (map[y][x - 1] === T.RIVER) || (map[y][x + 1] === T.RIVER);
+      const hasV = (map[y - 1] && map[y - 1][x] === T.RIVER) || (map[y + 1] && map[y + 1][x] === T.RIVER);
+      if (!hasH && !hasV) map[y][x] = T.PLAIN;
+    }
+  }
+  return map;
+}
+
+// 第四步：城池固定左右兩端中行，周圍 1 格強制平原
+function placeCastles(map) {
+  const rows = map.length, cols = map[0].length;
+  const mid = Math.floor(rows / 2);
+  const spots = [[1, mid, T.CASTLE_P], [cols - 2, mid, T.CASTLE_E]];
+  for (const [cx, cy, t] of spots) {
+    for (let dy = -1; dy <= 1; dy++)
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = cx + dx, ny = cy + dy;
+        if (nx >= 0 && nx < cols && ny >= 0 && ny < rows) map[ny][nx] = T.PLAIN;
+      }
+    map[cy][cx] = t;
+  }
+  return map;
+}
+
+// 第五步：BFS 連通性檢查（兩城池之間必須可通行）
+function isConnectedMap(map) {
+  const start = findTile(map, T.CASTLE_P), end = findTile(map, T.CASTLE_E);
+  if (!start || !end) return false;
+  const visited = new Set([start[0] + "," + start[1]]);
+  const queue = [start];
+  while (queue.length) {
+    const [x, y] = queue.shift();
+    if (x === end[0] && y === end[1]) return true;
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || ny >= map.length || nx >= map[0].length) continue;
+      const key = nx + "," + ny;
+      if (visited.has(key) || !TERRAIN_INFO[map[ny][nx]].passable) continue;
+      visited.add(key);
+      queue.push([nx, ny]);
+    }
+  }
+  return false;
+}
+
+// 備用地圖：全平原（必定連通）
+function generateFallbackMap(cols, rows) {
+  const map = [];
+  for (let y = 0; y < rows; y++) map[y] = new Array(cols).fill(T.PLAIN);
+  return placeCastles(map);
+}
+
+// 主函數：唔連通就 seed+1 重試，最多 10 次
+function generateMap(seed, cols, rows, difficulty) {
+  const w = getTileWeights(difficulty);
+  for (let attempt = 0; attempt < 10; attempt++) {
+    let map = generateRawMap(seed + attempt, cols, rows, w);
+    map = smoothMap(map, 3);
+    map = fixRivers(map);
+    map = placeCastles(map);
+    map = fixRivers(map);   // 城池周邊清地形後再修一次河流
+    if (isConnectedMap(map)) return { map, seed: seed + attempt };
+  }
+  return { map: generateFallbackMap(cols, rows), seed };
+}
+
+// 關卡 seed：前三關固定（難度曲線），之後全隨機
+function getRoundSeed(stage) {
+  const fixed = { 1: 1001, 2: 2002, 3: 3003 };
+  return fixed[stage] || Math.floor(Math.random() * 99999);
+}
+
 // ===== 主動技能 =====
 function canUseAbility(u) {
   return !!u.ability && !ABILITIES[u.ability].passive && u.cooldown === 0 && u.abilityUses > 0;
@@ -550,7 +688,12 @@ class BattleScene extends Phaser.Scene {
     this.enemyFaction = data.enemyFaction ||
       (this.playerFaction === "wei" ? "wu" : this.playerFaction === "shu" ? "wei" : "shu");
     this.difficulty = data.difficulty || "謀士";
-    this.map = parseMap(TEST_MAP_ROWS);   // Phase 7 改為隨機生成
+    this.stage = data.stage || 1;
+    // Phase 7：隨機地圖（前三關固定 seed，玩家可自訂）
+    const baseSeed = (data.seed != null) ? data.seed : getRoundSeed(this.stage);
+    const gen = generateMap(baseSeed, COLS, ROWS, this.difficulty);
+    this.map = gen.map;
+    this.usedSeed = gen.seed;
     this.riverTiles = [];
     this.waveOffset = 0;
     this.units = [];
@@ -608,6 +751,7 @@ class BattleScene extends Phaser.Scene {
     });
     this.input.keyboard.on("keydown-ESC", () => this.deselect());
     this.input.keyboard.on("keydown-ENTER", () => { if (!this.busy && this.turnSide === "player" && !this.battleOver) this.endPlayerTurn(); });
+    this.seedText.setText(`地圖 seed: ${this.usedSeed}`);
     this.refreshTopBar();
   }
 
